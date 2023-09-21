@@ -3,7 +3,6 @@ import time
 import numpy as np
 import torch
 import vedo
-
 # See https://github.com/google/aistplusplus_api/ for installation
 from aist_plusplus.features.kinetic import extract_kinetic_features
 from aist_plusplus.features.manual import extract_manual_features

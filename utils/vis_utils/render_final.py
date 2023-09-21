@@ -3,7 +3,7 @@ import os
 import numpy as np
 from trimesh import Trimesh
 
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+os.environ["PYOPENGL_PLATFORM"] = "egl"
 
 import imageio
 import pyrender
@@ -43,8 +43,9 @@ class WeakPerspectiveCamera(pyrender.Camera):
 
 
 class Renderer:
-    def __init__(self) -> None:
-        self.smpl_model = SMPL().eval()
+    def __init__(self, device) -> None:
+        self.device = device
+        self.smpl_model = SMPL().eval().to(device)
         base_color = (0.11, 0.53, 0.8, 0.5)
         self.material = pyrender.MetallicRoughnessMaterial(
             metallicFactor=0.7, alphaMode="OPAQUE", baseColorFactor=base_color
@@ -53,8 +54,8 @@ class Renderer:
         self.camera = pyrender.PerspectiveCamera(yfov=(np.pi / 3.0))
         self.light = pyrender.DirectionalLight(color=[1, 1, 1], intensity=300)
 
-    def process6D(self, aist_vec):
-        aist_ex = torch.Tensor(aist_vec)
+    def process6D(self, aist_vec: torch.Tensor):
+        aist_ex = aist_vec
         trans = aist_ex[:, :3]
         if aist_vec.shape[-1] == 135:
             rots = torch.cat((aist_ex[:, 3:], aist_ex[:, -12:]), 1)
@@ -71,12 +72,20 @@ class Renderer:
 
         return out_aist_og
 
-    def render(self, motion_vec, name, step=0, outdir="test_vis"):
-        smpl_dict = self.process6D(motion_vec[:, :135])
+    def render(
+        self,
+        motion_vec: torch.Tensor,
+        name: str,
+        step: int = 0,
+        outdir: str = "test_vis",
+    ):
+        smpl_dict = self.process6D(motion_vec[:, :135].to(self.device))
 
         vertices = smpl_dict["vertices"]
         frames = vertices.shape[0]
-        vertices = vertices - torch.Tensor([0, torch.mean(vertices[0], 0)[1], 0])
+        vertices = vertices - torch.Tensor([0, torch.mean(vertices[0], 0)[1], 0]).to(
+            self.device
+        )
 
         MINS = torch.min(torch.min(vertices, axis=0)[0], axis=0)[0]
         MAXS = torch.max(torch.max(vertices, axis=0)[0], axis=0)[0]

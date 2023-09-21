@@ -10,8 +10,9 @@ import typing as tp
 
 import numpy as np
 import torch.nn as nn
+from einops import rearrange
 
-from . import SConv1d, SConvTranspose1d
+from core.models.modules import SConv1d, SConvTranspose1d
 
 
 class SEANetResnetBlock(nn.Module):
@@ -204,8 +205,15 @@ class SEANetEncoder(nn.Module):
 
         self.model = nn.Sequential(*model)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, need_transpose=False):
+        if need_transpose:
+            x = rearrange(x, "b n d -> b d n")
+        out = self.model(x)
+
+        if need_transpose:
+            out = rearrange(out, "b d n -> b n d")
+
+        return out
 
 
 class SEANetDecoder(nn.Module):
@@ -337,22 +345,16 @@ class SEANetDecoder(nn.Module):
             model += [final_act(**final_activation_params)]
         self.model = nn.Sequential(*model)
 
-    def forward(self, z):
+    # def forward(self, z):
+    #     y = self.model(z)
+    #     return y
+
+    def forward(self, z, need_transpose=False):
+        if need_transpose:
+            z = rearrange(z, "b n d -> b d n")
         y = self.model(z)
+
+        if need_transpose:
+            y = rearrange(y, "b d n -> b n d")
+
         return y
-
-
-def test():
-    import torch
-
-    encoder = SEANetEncoder()
-    decoder = SEANetDecoder()
-    x = torch.randn(1, 1, 24000)
-    z = encoder(x)
-    assert list(z.shape) == [1, 128, 75], z.shape
-    y = decoder(z)
-    assert y.shape == x.shape, (x.shape, y.shape)
-
-
-if __name__ == "__main__":
-    test()

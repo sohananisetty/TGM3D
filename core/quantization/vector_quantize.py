@@ -127,7 +127,7 @@ def pad_shape(shape, size, dim=0):
 
 def sample_multinomial(total_count, probs):
     device = probs.device
-    probs = probs.cpu()
+    # probs = probs.cpu()
 
     total_count = probs.new_full((), total_count)
     remainder = probs.new_ones(())
@@ -280,6 +280,7 @@ class EuclideanCodebook(nn.Module):
         sync_affine_param=False,
         affine_param_batch_decay=0.99,
         affine_param_codebook_decay=0.9,
+        accelerator=None,
     ):
         super().__init__()
 
@@ -588,7 +589,7 @@ class VectorQuantize(nn.Module):
         commitment_use_cross_entropy_loss=False,
         stochastic_sample_codes=False,
         sample_codebook_temp=1.0,
-        sync_codebook=None,
+        sync_codebook=False,
         ema_update=True,
         learnable_codebook=False,
         in_place_codebook_optimizer: Callable[

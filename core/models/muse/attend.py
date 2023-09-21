@@ -36,6 +36,50 @@ def once(fn):
 
 print_once = once(print)
 
+
+class AbsolutePositionalEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len):
+        super().__init__()
+        self.scale = dim**-0.5
+        self.max_seq_len = max_seq_len
+        self.emb = nn.Embedding(max_seq_len, dim)
+
+    def forward(self, x, pos=None):
+        seq_len, device = x.shape[1], x.device
+        assert (
+            seq_len <= self.max_seq_len
+        ), f"you are passing in a sequence length of {seq_len} but your absolute positional embedding has a max sequence length of {self.max_seq_len}"
+
+        if not exists(pos):
+            pos = torch.arange(seq_len, device=device)
+
+        pos_emb = self.emb(pos)
+        pos_emb = pos_emb * self.scale
+        return pos_emb
+
+
+class ScaledSinusoidalEmbedding(nn.Module):
+    def __init__(self, dim, theta=10000):
+        super().__init__()
+        assert (dim % 2) == 0
+        self.scale = nn.Parameter(torch.ones(1) * dim**-0.5)
+
+        half_dim = dim // 2
+        freq_seq = torch.arange(half_dim).float() / half_dim
+        inv_freq = theta**-freq_seq
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, x, pos=None):
+        seq_len, device = x.shape[1], x.device
+
+        if not exists(pos):
+            pos = torch.arange(seq_len, device=device)
+
+        emb = einsum("i, j -> i j", pos, self.inv_freq)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb * self.scale
+
+
 # main class
 
 

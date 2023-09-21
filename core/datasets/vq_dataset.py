@@ -120,7 +120,9 @@ class VQMotionDataset(data.Dataset):
         print("Total number of motions {}".format(len(self.data)))
 
     def inv_transform(self, data: torch.Tensor) -> torch.Tensor:
-        return data * self.std + self.mean
+        return data * (torch.Tensor(self.std).to(data.device) - 1e-8) + torch.Tensor(
+            self.mean
+        ).to(data.device)
 
     def __len__(self) -> int:
         return len(self.data)
@@ -133,7 +135,7 @@ class VQMotionDataset(data.Dataset):
 
         motion = motion[idx : idx + window_size]
         "Z Normalization"
-        motion = (motion - self.mean) / self.std
+        motion = (motion - self.mean) / (self.std + 1e-8)
         return motion, self.id_list[item], window_size
 
 

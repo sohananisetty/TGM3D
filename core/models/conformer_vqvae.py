@@ -8,38 +8,52 @@ from typing import Tuple, Dict, Union, List
 from core.quantization.vector_quantize import VectorQuantize
 from core.models.seanet import SEANetEncoder, SEANetDecoder
 from core.models.resnet import Resnet1D
+from core.models.conformer import ConformerBlock
+from einops.layers.torch import Rearrange
 
 
 class Encoder(nn.Module):
     def __init__(
         self,
-        input_emb_width=256,
-        output_emb_width=512,
+        input_dim=256,
+        output_dim=768,
         down_sampling_ratio=4,
-        stride_t=2,
-        width=512,
+        n_heads=8,
+        dim=768,
         depth=3,
-        dilation_growth_rate=3,
-        activation="relu",
-        norm=None,
+        conv_expansion_factor=2,
+        dropout=0.2,
+        conv_kernel_size=5,
     ):
         super().__init__()
 
         blocks = []
-        k, p = stride_t * 2, stride_t // 2
-        blocks.append(nn.Conv1d(input_emb_width, width, 3, 1, 1))
-        blocks.append(nn.ReLU())
+        blocks.append(nn.Conv1d(input_dim, dim, 3, 1, 1))
+        blocks.append(nn.SiLU())
 
         for i in range(int(np.log2(down_sampling_ratio))):
-            input_dim = width
-            block = nn.Sequential(
-                nn.Conv1d(input_dim, width, k, stride_t, p),
-                Resnet1D(
-                    width, depth, dilation_growth_rate, activation=activation, norm=norm
-                ),
+            blocks.append(
+                Rearrange("b c n -> b n c"),
             )
+            for _ in range(depth):
+                block = ConformerBlock(
+                    dim=dim,
+                    dim_head=dim // n_heads,
+                    heads=n_heads,
+                    conv_expansion_factor=conv_expansion_factor,
+                    conv_kernel_size=conv_kernel_size,
+                    attn_dropout=dropout,
+                    ff_dropout=dropout,
+                    conv_dropout=dropout,
+                )
             blocks.append(block)
-        blocks.append(nn.Conv1d(width, output_emb_width, 3, 1, 1))
+            blocks.append(
+                Rearrange("b n c -> b c n"),
+            )
+            blocks.append(
+                nn.Conv1d(dim, dim, 3, 2, 1),
+            )
+        blocks.append(nn.Conv1d(dim, output_dim, 3, 1, 1))
         self.model = nn.Sequential(*blocks)
 
     def forward(self, x, need_transpose=False):
@@ -56,40 +70,46 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(
         self,
-        input_emb_width=256,
-        output_emb_width=512,
-        down_sampling_ratio=4,
-        stride_t=2,
-        width=512,
+        input_dim=256,
+        output_dim=768,
+        up_sampling_ratio=4,
+        n_heads=8,
+        dim=768,
         depth=3,
-        dilation_growth_rate=3,
-        activation="relu",
-        norm=None,
+        conv_expansion_factor=2,
+        dropout=0.2,
+        conv_kernel_size=5,
     ):
         super().__init__()
-        blocks = []
 
-        k, p = stride_t * 2, stride_t // 2
-        blocks.append(nn.Conv1d(output_emb_width, width, 3, 1, 1))
-        blocks.append(nn.ReLU())
-        for i in range(int(np.log2(down_sampling_ratio))):
-            out_dim = width
-            block = nn.Sequential(
-                Resnet1D(
-                    width,
-                    depth,
-                    dilation_growth_rate,
-                    reverse_dilation=True,
-                    activation=activation,
-                    norm=norm,
-                ),
-                nn.Upsample(scale_factor=2, mode="nearest"),
-                nn.Conv1d(width, out_dim, 3, 1, 1),
+        blocks = []
+        blocks.append(nn.Conv1d(output_dim, dim, 3, 1, 1))
+        blocks.append(nn.SiLU())
+
+        for i in range(int(np.log2(up_sampling_ratio))):
+            blocks.append(
+                Rearrange("b c n -> b n c"),
             )
+            for _ in range(depth):
+                block = ConformerBlock(
+                    dim=dim,
+                    dim_head=dim // n_heads,
+                    heads=n_heads,
+                    conv_expansion_factor=conv_expansion_factor,
+                    conv_kernel_size=conv_kernel_size,
+                    attn_dropout=dropout,
+                    ff_dropout=dropout,
+                    conv_dropout=dropout,
+                )
             blocks.append(block)
-        blocks.append(nn.Conv1d(width, width, 3, 1, 1))
-        blocks.append(nn.ReLU())
-        blocks.append(nn.Conv1d(width, input_emb_width, 3, 1, 1))
+            blocks.append(
+                Rearrange("b n c -> b c n"),
+            )
+            blocks.append(nn.Upsample(scale_factor=2, mode="nearest"))
+            blocks.append(
+                nn.Conv1d(dim, dim, 3, 1, 1),
+            )
+        blocks.append(nn.Conv1d(dim, input_dim, 3, 1, 1))
         self.model = nn.Sequential(*blocks)
 
     def forward(self, x, need_transpose=False):
@@ -103,10 +123,10 @@ class Decoder(nn.Module):
         return out
 
 
-class ConvVQMotionModel(nn.Module):
+class ConformerVQMotionModel(nn.Module):
     """Audio Motion VQGAN model."""
 
-    def __init__(self, args, is_distributed=False, device="cuda"):
+    def __init__(self, args, device="cuda"):
         """Initializer for VQGANModel.
 
         Args:
@@ -114,40 +134,28 @@ class ConvVQMotionModel(nn.Module):
         is_training: bool. true for training model, false for eval model. Controls
                 whether dropout will be applied.
         """
-        super(ConvVQMotionModel, self).__init__()
+        super(ConformerVQMotionModel, self).__init__()
 
         self.device = device
         self.dim = args.motion_dim
 
         self.motionEncoder = Encoder(
-            input_emb_width=args.motion_dim,
-            output_emb_width=args.enc_dec_dim,
-            width=args.width,
+            input_dim=args.motion_dim,
+            output_dim=args.enc_dec_dim,
+            dim=args.enc_dec_dim,
             down_sampling_ratio=args.down_sampling_ratio,
-            depth=args.resnet_depth,
+            depth=args.depth,
+            n_heads=args.heads,
         )
 
         self.motionDecoder = Decoder(
-            input_emb_width=args.motion_dim,
-            output_emb_width=args.enc_dec_dim,
-            width=args.width,
-            down_sampling_ratio=args.down_sampling_ratio,
-            depth=args.resnet_depth,
+            input_dim=args.motion_dim,
+            output_dim=args.enc_dec_dim,
+            dim=args.enc_dec_dim,
+            up_sampling_ratio=args.down_sampling_ratio,
+            depth=args.depth,
+            n_heads=args.heads,
         )
-
-        # self.motionEncoder = SEANetEncoder(
-        #     channels=args.motion_dim,
-        #     dimension=args.enc_dec_dim,
-        #     ratios=[2, 2],
-        #     causal=True,
-        # )
-
-        # self.motionDecoder = SEANetDecoder(
-        #     channels=args.motion_dim,
-        #     dimension=args.enc_dec_dim,
-        #     ratios=[2, 2],
-        #     causal=True,
-        # )
 
         self.vq = VectorQuantize(
             dim=args.enc_dec_dim,
@@ -160,7 +168,7 @@ class ConvVQMotionModel(nn.Module):
             sample_codebook_temp=0.2,
             affine_param=True,
             sync_update_v=0.2,
-            sync_codebook=is_distributed,
+            sync_codebook=False,
         )
 
     def forward(

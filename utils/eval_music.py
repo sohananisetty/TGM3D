@@ -6,21 +6,15 @@ import librosa
 import numpy as np
 import torch
 from tqdm import tqdm
-from utils.aist_metrics.calculate_beat_scores import alignment_score, motion_peak_onehot
+from utils.aist_metrics.calculate_beat_scores import (alignment_score,
+                                                      motion_peak_onehot)
 from utils.aist_metrics.calculate_fid_scores import (
-    calculate_avg_distance,
-    calculate_frechet_distance,
-    calculate_frechet_feature_distance,
-    extract_feature,
-)
+    calculate_avg_distance, calculate_frechet_distance,
+    calculate_frechet_feature_distance, extract_feature)
 from utils.aist_metrics.features import kinetic, manual
-from utils.eval_trans import (
-    calculate_diversity,
-    calculate_frechet_distance,
-    calculate_multimodality,
-    calculate_R_precision,
-    calculate_top_k,
-)
+from utils.eval_trans import (calculate_diversity, calculate_frechet_distance,
+                              calculate_multimodality, calculate_R_precision,
+                              calculate_top_k)
 from utils.motion_process import recover_from_ric
 
 genre_dict = {

@@ -82,6 +82,7 @@ cfg.vqvae.freeze_model = False
 ## Loss
 cfg.vqvae.commit = 1.0  # "hyper-parameter for the commitment loss"
 cfg.vqvae.loss_vel = 1.0
+cfg.vqvae.loss_motion = 1.0
 cfg.vqvae.recons_loss = "l1_smooth"  # l1_smooth , l1 , l2
 cfg.vqvae.window_size = 64
 cfg.vqvae.max_length_seconds = 3.2

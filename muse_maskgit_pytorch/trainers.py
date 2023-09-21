@@ -6,7 +6,8 @@ from shutil import rmtree
 
 import torch
 import torchvision.transforms as T
-from accelerate import Accelerator, DistributedDataParallelKwargs, DistributedType
+from accelerate import (Accelerator, DistributedDataParallelKwargs,
+                        DistributedType)
 from beartype import beartype
 from einops import rearrange
 from ema_pytorch import EMA

@@ -10,7 +10,9 @@ def load_dataset(
     dataset_names: List[str],
     args: Dict,
     split: str = "train",
+    weight_scale: List[int] = [1, 1, 1],
 ):
+    assert len(dataset_names) == len(weight_scale), "mismatch in size"
     dataset_list = []
     weights = []
     for dataset_name in dataset_names:
@@ -30,8 +32,10 @@ def load_dataset(
     if split != "train" or len(dataset_names) == 1:
         return concat_dataset, None, None
 
-    for ds in dataset_list:
-        weights.append([concat_dataset.__len__() / (ds.__len__())] * ds.__len__())
+    for i, ds in enumerate(dataset_list):
+        weights.append(
+            [weight_scale[i] * concat_dataset.__len__() / (ds.__len__())] * ds.__len__()
+        )
 
     weights = list(itertools.chain.from_iterable(weights))
 

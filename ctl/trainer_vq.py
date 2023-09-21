@@ -11,12 +11,6 @@ import wandb
 from accelerate import Accelerator, DistributedType
 from accelerate.utils import DistributedDataParallelKwargs
 
-from torch import nn
-from tqdm import tqdm
-from transformers import AdamW, get_scheduler
-
-from yacs.config import CfgNode
-
 # from core.datasets import dataset_TM_eval
 from core.datasets.dataset_loading_utils import load_dataset
 from core.datasets.vq_dataset import DATALoader, MotionCollator
@@ -25,9 +19,15 @@ from core.models.conv_vqvae import ConvVQMotionModel
 # from core.models.evaluator_wrapper import EvaluatorModelWrapper
 from core.models.loss import ReConsLoss
 from core.optimizer import get_optimizer
+from torch import nn
+from tqdm import tqdm
+from transformers import AdamW, get_scheduler
 
 # from utils.eval_trans import evaluation_vqvae, evaluation_vqvae_loss
 from utils.vis_utils.render_final import Renderer
+from yacs.config import CfgNode
+from core.models.conv_vqvae import ConvVQMotionModel
+from core.models.conformer_vqvae import ConformerVQMotionModel
 
 # from utils.word_vectorizer import WordVectorizer
 
@@ -80,15 +80,11 @@ def has_duplicates(tup):
 class VQVAEMotionTrainer(nn.Module):
     def __init__(
         self,
-        vqvae_model: ConvVQMotionModel,
         args: CfgNode,
         accelerate_kwargs: dict = dict(),
     ):
         super().__init__()
         self.model_name = args.vqvae_model_name
-
-        kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        self.accelerator = Accelerator(kwargs_handlers=[kwargs], **accelerate_kwargs)
 
         transformers.set_seed(42)
 
@@ -103,9 +99,11 @@ class VQVAEMotionTrainer(nn.Module):
         self.num_stages = self.training_args.num_stages
         self.output_dir = Path(self.args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
         self.register_buffer("steps", torch.Tensor([0]))
-        self.vqvae_model = vqvae_model
+
+        self.vqvae_model = ConformerVQMotionModel(
+            self.vqvae_args,
+        ).to(self.device)
         total = sum(p.numel() for p in self.vqvae_model.parameters() if p.requires_grad)
         print("Total training params: %.2fM" % (total / 1e6))
 
@@ -144,12 +142,19 @@ class VQVAEMotionTrainer(nn.Module):
 
         if self.dataset_args.dataset_name == "mix":
             train_ds, sampler_train, weights_train = load_dataset(
-                ["t2m", "aist", "cm"], self.args, "train"
+                dataset_names=["t2m", "aist", "cm"],
+                args=self.args,
+                split="train",
+                weight_scale=[1, 1, 1],
             )
-            test_ds, _, _ = load_dataset(["t2m", "aist", "cm"], self.args, "test")
+            test_ds, _, _ = load_dataset(
+                dataset_names=["t2m", "aist", "cm"], args=self.args, split="test"
+            )
             self.render_ds, _, _ = load_dataset(
-                ["t2m", "aist", "cm"], self.args, "render"
+                dataset_names=["t2m", "aist", "cm"], args=self.args, split="render"
             )
+
+            # if self.is_main:
             self.print(
                 f"training with training {len(train_ds)} and test dataset of  and  {len(test_ds)} samples and reder of  {len(self.render_ds)}"
             )
@@ -164,8 +169,10 @@ class VQVAEMotionTrainer(nn.Module):
             self.render_ds, _, _ = load_dataset(
                 [self.dataset_args.dataset_name], self.args, "render"
             )
+
+            # if self.is_main:
             self.print(
-                f"training with training {len(train_ds)} and test dataset of  and  {len(test_ds)} samples and reder of  {len(self.render_ds)}"
+                f"training with training {len(train_ds)} and test dataset of  and  {len(test_ds)} samples and render of  {len(self.render_ds)}"
             )
 
         # dataloader
@@ -188,53 +195,16 @@ class VQVAEMotionTrainer(nn.Module):
             self.render_ds, batch_size=1, shuffle=False, collate_fn=collate_fn
         )
 
-        # if self.is_main:
-        #     self.w_vectorizer = WordVectorizer(
-        #         "/srv/scratch/sanisetty3/music_motion/T2M-GPT/glove", "our_vab"
-        #     )
-        #     self.eval_wrapper = EvaluatorModelWrapper(self.eval_args)
-        #     self.tm_eval = dataset_TM_eval.DATALoader(
-        #         batch_size=self.training_args.eval_bs,
-        #         w_vectorizer=self.w_vectorizer,
-        #     )
-
-        # prepare with accelerator
-
-        (
-            self.vqvae_model,
-            self.optim,
-            self.dl,
-            self.valid_dl,
-            self.render_dl,
-        ) = self.accelerator.prepare(
-            self.vqvae_model,
-            self.optim,
-            self.dl,
-            self.valid_dl,
-            self.render_dl,
-        )
-
-        self.accelerator.register_for_checkpointing(self.lr_scheduler)
-
         self.dl_iter = cycle(self.dl)
         # self.valid_dl_iter = cycle(self.valid_dl)
 
-        self.renderer = Renderer()
+        self.renderer = Renderer(self.device)
 
         self.save_model_every = self.training_args.save_steps
         self.log_losses_every = self.training_args.logging_steps
         self.evaluate_every = self.training_args.evaluate_every
         self.calc_metrics_every = self.training_args.evaluate_every
         self.wandb_every = self.training_args.wandb_every
-
-        hps = {
-            "num_train_steps": self.num_train_steps,
-            "learning_rate": self.training_args.learning_rate,
-        }
-        self.accelerator.init_trackers(f"{self.model_name}", config=hps)
-        self.codebook_indices_usage = {
-            f"{i}": 0 for i in np.arange(self.vqvae_args.codebook_size)
-        }
 
         self.best_fid = float("inf")
         self.best_div = float("-inf")
@@ -243,16 +213,19 @@ class VQVAEMotionTrainer(nn.Module):
         self.best_top3 = float("-inf")
         self.best_matching = float("inf")
 
-        if self.is_main:
-            wandb.login()
-            wandb.init(project=self.model_name)
+        # if self.is_main:
+        wandb.login()
+        wandb.init(project=self.model_name)
 
     def print(self, msg):
-        self.accelerator.print(msg)
+        # self.accelerator.print(msg)
+        print(msg)
 
     @property
     def device(self):
-        return self.accelerator.device
+        return torch.device("cuda")
+
+    # self.accelerator.device
 
     @property
     def is_distributed(self):
@@ -271,106 +244,140 @@ class VQVAEMotionTrainer(nn.Module):
 
     def save(self, path, loss=None):
         pkg = dict(
-            model=self.accelerator.get_state_dict(self.vqvae_model),
+            model=self.vqvae_model.state_dict(),
             optim=self.optim.state_dict(),
             steps=self.steps,
             total_loss=self.best_loss if loss is None else loss,
         )
+        # self.accelerator.wait_for_everyone()
+        # self.accelerator.save_model(pkg, path)
         torch.save(pkg, path)
-
-    @property
-    def unwrapped_vqvae_model(self):
-        return self.accelerator.unwrap_model(self.vqvae_model)
 
     def load(self, path):
         path = Path(path)
         assert path.exists()
-        pkg = torch.load(str(path), map_location="cpu")
+        pkg = torch.load(str(path), map_location="cuda")
+        self.vqvae_model.vq._codebook.batch_mean = pkg["model"][
+            "vq._codebook.batch_mean"
+        ]
+        self.vqvae_model.vq._codebook.batch_variance = pkg["model"][
+            "vq._codebook.batch_variance"
+        ]
 
-        self.unwrapped_vqvae_model.load_state_dict(pkg["model"])
+        self.vqvae_model.load_state_dict(pkg["model"])
+        # self.vqvae_model = self.vqvae_model.to(self.device)
 
         self.optim.load_state_dict(pkg["optim"])
         self.steps = pkg["steps"]
         self.best_loss = pkg["total_loss"]
-        # print("Loading at stage" , np.searchsorted(self.stage_steps , int(self.steps.item())) - 1)
-        self.stage = max(
-            np.searchsorted(self.stage_steps, int(self.steps.item())) - 1, 0
-        )
-        print("starting at step: ", self.steps, "and stage", self.stage)
-
-        if not self.training_args.use_mixture:
-            self.dl.dataset.set_stage(self.stage)
-        else:
-            self.dl.dataset.datasets[0].set_stage(self.stage)
-            self.dl.dataset.datasets[1].set_stage(self.stage)
 
     def train_step(self):
         steps = int(self.steps.item())
 
         log_losses = self.log_losses_every > 0 and not (steps % self.log_losses_every)
 
-        self.vqvae_model.train()
+        self.vqvae_model = self.vqvae_model.train()
 
         # logs
 
         logs = {}
 
+        # for idx in range(self.grad_accum_every):
+        #     batch = next(self.dl_iter)
+        #     gt_motion = batch["motion"]
+        #     print(gt_motion.device, self.vqvae_model.device)
+
+        #     if idx != (self.grad_accum_every - 1):
+        #         with self.accelerator.no_sync(self.vqvae_model):
+        #             pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
+        #             loss_motion = self.loss_fnc(pred_motion, gt_motion)
+        #             loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
+        #             loss = (
+        #                 loss_motion
+        #                 + self.vqvae_args.commit * commit_loss
+        #                 + self.vqvae_args.loss_vel * loss_vel
+        #             )
+
+        #             self.accelerator.backward(loss)
+
+        #     else:
+        #         pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
+        #         loss_motion = self.loss_fnc(pred_motion, gt_motion)
+        #         loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
+        #         loss = (
+        #             loss_motion
+        #             + self.vqvae_args.commit * commit_loss
+        #             + self.vqvae_args.loss_vel * loss_vel
+        #         )
+
+        #         self.accelerator.backward(loss)
+
+        #         self.optim.step()
+        #         self.lr_scheduler.step()
+        #         self.optim.zero_grad()
+
+        # used_indices = indices.flatten().tolist()
+        # for ui in used_indices:
+        #     self.codebook_indices_usage[f"{ui}"] += 1
+        # usage = (
+        #     len([k for k, v in self.codebook_indices_usage.items() if v != 0])
+        #     / self.vqvae_args.codebook_size
+        # )
+
+        # # accum_log(
+        # logs = (
+        #     dict(
+        #         loss=loss.detach().cpu(),
+        #         loss_motion=loss_motion.detach().cpu(),
+        #         loss_vel=loss_vel.detach().cpu(),
+        #         commit_loss=commit_loss.detach().cpu(),
+        #         usage=usage,
+        #     ),
+        # )
+        # # )
+
         for _ in range(self.grad_accum_every):
             batch = next(self.dl_iter)
 
-            gt_motion = batch["motion"]
+            gt_motion = batch["motion"].to(self.device)
+            # print(self.vqvae_model.device, self.vqvae_model.device)
 
-            if self.enable_var_len is False:
-                pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
-                loss_motion = self.loss_fnc(pred_motion, gt_motion)
-                loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
-                loss = (
-                    loss_motion
-                    + self.vqvae_args.commit * commit_loss
-                    + self.vqvae_args.loss_vel * loss_vel
-                )
+            pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
+            loss_motion = self.loss_fnc(pred_motion, gt_motion)
+            loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
+            # print(loss_motion.shape, loss_vel.shape, commit_loss.shape)
 
-            else:
-                mask = batch["motion_mask"]
-                lengths = batch["motion_lengths"]
-
-                pred_motion, indices, commit_loss = self.vqvae_model(gt_motion, mask)
-                loss_motion = self.loss_fnc(pred_motion, gt_motion, mask)
-                loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion, mask)
-                loss = (
-                    loss_motion
-                    + self.vqvae_args.commit * commit_loss
-                    + self.vqvae_args.loss_vel * loss_vel
-                )
+            loss = (
+                self.vqvae_args.loss_motion * loss_motion
+                + self.vqvae_args.commit * commit_loss
+                + self.vqvae_args.loss_vel * loss_vel
+            ) / self.grad_accum_every
 
             used_indices = indices.flatten().tolist()
-            for ui in used_indices:
-                self.codebook_indices_usage[f"{ui}"] += 1
-            usage = (
-                len([k for k, v in self.codebook_indices_usage.items() if v != 0])
-                / self.vqvae_args.codebook_size
-            )
+            # for ui in used_indices:
+            #     self.codebook_indices_usage[f"{ui}"] += 1
+            usage = len(set(used_indices)) / self.vqvae_args.codebook_size
 
             # print(loss,loss.shape)
 
-            self.accelerator.backward(loss / self.grad_accum_every)
+            # self.accelerator.backward(loss / self.grad_accum_every)
+            loss.backward()
 
             accum_log(
                 logs,
                 dict(
-                    loss=loss.detach().cpu() / self.grad_accum_every,
+                    loss=loss.detach().cpu(),
                     loss_motion=loss_motion.detach().cpu() / self.grad_accum_every,
                     loss_vel=loss_vel.detach().cpu() / self.grad_accum_every,
                     commit_loss=commit_loss.detach().cpu() / self.grad_accum_every,
-                    avg_max_length=int(max(lengths)) / self.grad_accum_every,
                     usage=usage / self.grad_accum_every,
                 ),
             )
 
-        if exists(self.max_grad_norm):
-            self.accelerator.clip_grad_norm_(
-                self.vqvae_model.parameters(), self.max_grad_norm
-            )
+        # if exists(self.max_grad_norm):
+        #     self.accelerator.clip_grad_norm_(
+        #         self.vqvae_model.parameters(), self.max_grad_norm
+        #     )
 
         self.optim.step()
         self.lr_scheduler.step()
@@ -378,38 +385,39 @@ class VQVAEMotionTrainer(nn.Module):
 
         # build pretty printed losses
 
-        losses_str = f"{steps}: vqvae model total loss: {logs['loss'].float():.3} reconstruction loss: {logs['loss_motion'].float():.3} loss_vel: {logs['loss_vel'].float():.3} commitment loss: {logs['commit_loss'].float():.3} codebook usage: {logs['usage'].float():.3}"
+        losses_str = f"{steps}: vqvae model total loss: {logs['loss'].float():.3} reconstruction loss: {logs['loss_motion'].float():.3} loss_vel: {logs['loss_vel'].float():.3} commitment loss: {logs['commit_loss'].float():.3} codebook usage: {logs['usage']}"
 
-        if log_losses:
-            self.accelerator.log(
-                {
-                    "total_loss": logs["loss"],
-                    "loss_motion": logs["loss_motion"],
-                    "loss_vel": logs["loss_vel"],
-                    "commit_loss": logs["commit_loss"],
-                    "average_max_length": logs["avg_max_length"],
-                    "codebook_usage": logs["usage"],
-                },
-                step=steps,
-            )
+        # if log_losses:
+        #     self.accelerator.log(
+        #         {
+        #             "total_loss": logs["loss"],
+        #             "loss_motion": logs["loss_motion"],
+        #             "loss_vel": logs["loss_vel"],
+        #             "commit_loss": logs["commit_loss"],
+        #             "average_max_length": logs["avg_max_length"],
+        #             "codebook_usage": logs["usage"],
+        #         },
+        #         step=steps,
+        #     )
 
         # log
-        if self.is_main and (steps % self.wandb_every == 0):
+        if steps % self.wandb_every == 0:
             for key, value in logs.items():
                 wandb.log({f"train_loss/{key}": value})
 
-        self.print(losses_str)
+            self.print(losses_str)
 
-        if self.is_main and (steps % self.evaluate_every == 0):
+        if steps % self.evaluate_every == 0:
             self.validation_step()
             self.sample_render(os.path.join(self.output_dir, "samples"))
 
-        # if self.is_main and (steps % self.calc_metrics_every == 0):
-        #     self.calculate_metrics(steps, logs["loss"])
+        # if self.is_main and steps % self.evaluate_every == 0:
+        #     self.sample_render(os.path.join(self.output_dir, "samples"))
 
         # save model
 
-        if self.is_main and not (steps % self.save_model_every) and steps > 0:
+        # if self.is_main and not (steps % self.save_model_every) and steps > 0:
+        if not (steps % self.save_model_every):
             os.makedirs(os.path.join(self.output_dir, "checkpoints"), exist_ok=True)
             model_path = os.path.join(
                 self.output_dir, "checkpoints", f"vqvae_motion.{steps}.pt"
@@ -428,72 +436,34 @@ class VQVAEMotionTrainer(nn.Module):
         self.steps += 1
         return logs
 
-    # def calculate_metrics(self, steps, loss):
-    #     (
-    #         best_fid,
-    #         best_iter,
-    #         best_div,
-    #         best_top1,
-    #         best_top2,
-    #         best_top3,
-    #         best_matching,
-    #     ) = evaluation_vqvae_loss(
-    #         best_fid=self.best_fid,
-    #         best_div=self.best_div,
-    #         best_top1=self.best_top1,
-    #         best_top2=self.best_top2,
-    #         best_top3=self.best_top3,
-    #         best_matching=self.best_matching,
-    #         val_loader=self.tm_eval,
-    #         net=self.vqvae_model,
-    #         nb_iter=steps,
-    #         eval_wrapper=self.eval_wrapper,
-    #         save=False,
-    #     )
-    #     if best_fid < self.best_fid:
-    #         model_path = os.path.join(self.output_dir, f"vqvae_motion_best_fid.pt")
-    #         self.save(model_path, loss=loss)
-
-    #     wandb.log({f"best_fid": best_fid})
-    #     wandb.log({f"best_div": best_div})
-    #     wandb.log({f"best_top1": best_top1})
-    #     wandb.log({f"best_top2": best_top2})
-    #     wandb.log({f"best_top3": best_top3})
-    #     wandb.log({f"best_matching": best_matching})
-
-    #     (
-    #         self.best_fid,
-    #         self.best_iter,
-    #         self.best_div,
-    #         self.best_top1,
-    #         self.best_top2,
-    #         self.best_top3,
-    #         self.best_matching,
-    #     ) = (
-    #         best_fid,
-    #         best_iter,
-    #         best_div,
-    #         best_top1,
-    #         best_top2,
-    #         best_top3,
-    #         best_matching,
-    #     )
-
     def validation_step(self):
         self.vqvae_model.eval()
         val_loss_ae = {}
         all_loss = 0.0
 
-        print(f"validation start")
+        self.print(f"validation start")
 
         with torch.no_grad():
-            for batch in tqdm((self.valid_dl), position=0, leave=True):
-                gt_motion = batch["motion"]
+            for batch in tqdm(
+                (self.valid_dl),
+                position=0,
+                leave=True,
+                # disable=not self.accelerator.is_main_process,
+            ):
+                gt_motion = batch["motion"].to(self.device)
 
                 pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
+                # (
+                #     all_pred_motion,
+                #     all_commit_loss,
+                #     all_gt_motion,
+                # ) = self.accelerator.gather_for_metrics(
+                #     (pred_motion, commit_loss, gt_motion)
+                # )
+                # loss_motion = self.loss_fnc(all_pred_motion, all_gt_motion)
+                # loss_vel = self.loss_fnc.forward_vel(all_pred_motion, all_gt_motion)
                 loss_motion = self.loss_fnc(pred_motion, gt_motion)
                 loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
-
                 loss = (
                     loss_motion
                     + self.vqvae_args.commit * commit_loss
@@ -539,8 +509,10 @@ class VQVAEMotionTrainer(nn.Module):
         self.vqvae_model.eval()
         print(f"render start")
         with torch.no_grad():
-            for idx, batch in tqdm(enumerate(self.render_dl)):
-                gt_motion = batch["motion"]
+            for idx, batch in tqdm(
+                enumerate(self.render_dl),
+            ):
+                gt_motion = batch["motion"].to(self.device)
                 name = str(batch["names"][0])
 
                 curr_dataset_idx = np.searchsorted(dataset_lens, idx + 1)
@@ -553,28 +525,28 @@ class VQVAEMotionTrainer(nn.Module):
 
                 gt_motion = (
                     self.render_ds.datasets[curr_dataset_idx]
-                    .inv_transform(batch["motion"])
+                    .inv_transform(gt_motion.cpu())
                     .squeeze()
                     .float()
                 )
                 pred_motion = (
                     self.render_ds.datasets[curr_dataset_idx]
-                    .inv_transform(batch["motion"])
+                    .inv_transform(pred_motion.cpu())
                     .squeeze()
                     .float()
                 )
 
                 self.renderer.render(
-                    gt_motion,
+                    motion_vec=gt_motion,
                     outdir=save_path,
-                    step=self.steps,
-                    name=f"{name}",
+                    step=int(self.steps.item()),
+                    name=f"{name}_gt",
                 )
                 self.renderer.render(
-                    pred_motion,
+                    motion_vec=pred_motion,
                     outdir=save_path,
-                    step=self.steps,
-                    name=f"{name}",
+                    step=int(self.steps.item()),
+                    name=f"{name}_pred",
                 )
 
         self.vqvae_model.train()
@@ -584,10 +556,10 @@ class VQVAEMotionTrainer(nn.Module):
         print(self.output_dir)
 
         if resume:
-            save_path = os.path.join(self.output_dir, "checkpoints")
-            chk = sorted(os.listdir(save_path), key=lambda x: int(x.split(".")[1]))[-1]
-            print("resuming from ", os.path.join(save_path, f"{chk}"))
-            self.load(os.path.join(save_path, f"{chk}"))
+            save_path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/checkpoints/conformer_512_1024_affine/checkpoints/vqvae_motion.150000.pt"
+            # chk = sorted(os.listdir(save_path), key=lambda x: int(x.split(".")[1]))[-1]
+            print("resuming from ", save_path)
+            self.load(save_path)
 
         while self.steps < self.num_train_steps:
             logs = self.train_step()
