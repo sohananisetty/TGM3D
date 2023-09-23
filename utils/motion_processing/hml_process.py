@@ -1,19 +1,19 @@
+import os
+
 import numpy as np
 import torch
-import os
 from quaternion import (
-    qinv,
-    qrot,
-    quaternion_to_cont6d,
     qbetween_np,
+    qfix,
+    qinv,
     qinv_np,
     qmul_np,
     qrot,
     qrot_np,
+    quaternion_to_cont6d,
     quaternion_to_cont6d_np,
-    qfix,
 )
-from skeleton import Skeleton, t2m_raw_offsets, t2m_kinematic_chain
+from skeleton import Skeleton, t2m_kinematic_chain, t2m_raw_offsets
 
 l_idx1, l_idx2 = 5, 8
 # Right/Left foot

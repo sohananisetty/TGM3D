@@ -1,10 +1,10 @@
-import torch
 from glob import glob
 from typing import List, Tuple
-from scipy.spatial.transform import Rotation as R
-import utils.rotation_conversions as geometry
 
+import torch
+import utils.rotation_conversions as geometry
 from core.models.smpl import SMPL
+from scipy.spatial.transform import Rotation as R
 
 # Lower legs
 l_idx1, l_idx2 = 5, 8

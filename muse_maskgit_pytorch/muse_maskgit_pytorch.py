@@ -1,24 +1,19 @@
 import math
-from random import random
+import pathlib
 from functools import partial
+from pathlib import Path
+from random import random
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
-from torch import nn, einsum
-import pathlib
-from pathlib import Path
 import torchvision.transforms as T
-
-from typing import Callable, Optional, List
-
-from einops import rearrange, repeat
-
 from beartype import beartype
-
-from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
-from muse_maskgit_pytorch.t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
+from einops import rearrange, repeat
 from muse_maskgit_pytorch.attend import Attend
-
+from muse_maskgit_pytorch.t5 import DEFAULT_T5_NAME, get_encoded_dim, t5_encode_text
+from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
+from torch import einsum, nn
 from tqdm.auto import tqdm
 
 # helpers

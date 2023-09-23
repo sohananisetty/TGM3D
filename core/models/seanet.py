@@ -10,9 +10,8 @@ import typing as tp
 
 import numpy as np
 import torch.nn as nn
-from einops import rearrange
-
 from core.models.modules import SConv1d, SConvTranspose1d
+from einops import rearrange
 
 
 class SEANetResnetBlock(nn.Module):

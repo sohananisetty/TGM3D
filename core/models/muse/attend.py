@@ -1,8 +1,22 @@
+import math
 from collections import namedtuple
+from dataclasses import dataclass
+from enum import Enum
 from functools import wraps
+from itertools import partial
 
 import torch
 import torch.nn.functional as F
+from core.models.utils import (
+    LayerNorm,
+    create_causal_mask,
+    default,
+    dropout_seq,
+    exists,
+    l2norm,
+    print_once,
+)
+from einops import rearrange, repeat
 from memory_efficient_attention_pytorch.flash_attention import FlashAttentionFunction
 from packaging import version
 from torch import einsum, nn
@@ -13,82 +27,48 @@ AttentionConfig = namedtuple(
     "AttentionConfig", ["enable_flash", "enable_math", "enable_mem_efficient"]
 )
 
-# helpers
 
-
-def exists(val):
-    return val is not None
-
-
-def once(fn):
-    called = False
-
-    @wraps(fn)
-    def inner(x):
-        nonlocal called
-        if called:
-            return
-        called = True
-        return fn(x)
-
-    return inner
-
-
-print_once = once(print)
-
-
-class AbsolutePositionalEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len):
-        super().__init__()
-        self.scale = dim**-0.5
-        self.max_seq_len = max_seq_len
-        self.emb = nn.Embedding(max_seq_len, dim)
-
-    def forward(self, x, pos=None):
-        seq_len, device = x.shape[1], x.device
-        assert (
-            seq_len <= self.max_seq_len
-        ), f"you are passing in a sequence length of {seq_len} but your absolute positional embedding has a max sequence length of {self.max_seq_len}"
-
-        if not exists(pos):
-            pos = torch.arange(seq_len, device=device)
-
-        pos_emb = self.emb(pos)
-        pos_emb = pos_emb * self.scale
-        return pos_emb
-
-
-class ScaledSinusoidalEmbedding(nn.Module):
-    def __init__(self, dim, theta=10000):
-        super().__init__()
-        assert (dim % 2) == 0
-        self.scale = nn.Parameter(torch.ones(1) * dim**-0.5)
-
-        half_dim = dim // 2
-        freq_seq = torch.arange(half_dim).float() / half_dim
-        inv_freq = theta**-freq_seq
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-
-    def forward(self, x, pos=None):
-        seq_len, device = x.shape[1], x.device
-
-        if not exists(pos):
-            pos = torch.arange(seq_len, device=device)
-
-        emb = einsum("i, j -> i j", pos, self.inv_freq)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb * self.scale
+@dataclass
+class AttentionParams:
+    dim: int = 768
+    dim_head: int = 96
+    heads: int = 8
+    causal: bool = False
+    qk_norm: bool = False
+    qk_norm_scale: int = 8
+    dropout: float = 0.0
+    cross_attn_tokens_dropout: float = (0.0,)
+    add_null_kv: bool = False
+    flash: bool = False
 
 
 # main class
 
 
 class Attend(nn.Module):
-    def __init__(self, scale=8, dropout=0.0, flash=False):
+    def __init__(
+        self,
+        dropout=0.0,
+        causal=False,
+        scale=None,
+        qk_norm=False,
+        flash=False,
+    ):
         super().__init__()
         self.scale = scale
+        self.qk_norm = qk_norm
+
+        self.causal = causal
+        self.create_causal_mask = create_causal_mask
+
+        self.attn_fn = (
+            partial(F.softmax, dtype=torch.float32) if not qk_norm else F.softmax
+        )
+
         self.dropout = dropout
         self.attn_dropout = nn.Dropout(dropout)
+
+        # flash attention
 
         self.flash = flash
         assert not (
@@ -97,13 +77,9 @@ class Attend(nn.Module):
 
         # determine efficient attention configs for cuda and cpu
 
-        self.cuda_config = None
-        self.no_hardware_detected = False
-
-        if not torch.cuda.is_available() or not flash:
-            return
-
         device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
+
+        major, minor = device_properties.major, device_properties.minor
 
         if device_properties.major == 8 and device_properties.minor == 0:
             print_once(
@@ -116,54 +92,89 @@ class Attend(nn.Module):
             )
             self.cuda_config = AttentionConfig(False, True, False)
 
-    def flash_attn(self, q, k, v, mask=None):
-        default_scale = q.shape[-1] ** -0.5
+    def flash_attn(self, q, k, v, mask=None, attn_bias=None):
+        batch, heads, q_len, _, k_len, is_cuda, device = (
+            *q.shape,
+            k.shape[-2],
+            q.is_cuda,
+            q.device,
+        )
 
-        is_cuda = q.is_cuda
+        # Recommended for multi-query single-key-value attention by Tri Dao
+        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
 
-        q, k, v = map(lambda t: t.contiguous(), (q, k, v))
+        if k.ndim == 3:
+            k = rearrange(k, "b ... -> b 1 ...").expand_as(q)
 
-        # scaled_dot_product_attention does not allow for custom scale
-        # so hack it in, to support rmsnorm-ed queries and keys
+        if v.ndim == 3:
+            v = rearrange(v, "b ... -> b 1 ...").expand_as(q)
 
-        rescale = self.scale / default_scale
+        # handle scale - by default they scale by dim_head ** -0.5, but need to take care if using cosine sim attention
 
-        q = q * (rescale**0.5)
-        k = k * (rescale**0.5)
+        if self.qk_norm:
+            default_scale = q.shape[-1] ** -0.5
+            q = q * (default_scale / self.scale)
 
-        # use naive implementation if not correct hardware
+        # Check if mask exists and expand to compatible shape
+        # The mask is B L, so it would have to be expanded to B H N L
 
-        # the below logic can also incorporate whether masking is needed or not
+        causal = self.causal
 
-        use_naive = not is_cuda or not exists(self.cuda_config)
+        if exists(mask):
+            assert mask.ndim == 4
+            mask = mask.expand(batch, heads, q_len, k_len)
 
-        if not is_cuda or self.no_hardware_detected:
-            return FlashAttentionFunction.apply(q, k, v, mask, False, 512, 512)
+            # manually handle causal mask, if another mask was given
 
-        # use naive implementation
+            if causal:
+                causal_mask = self.create_causal_mask(q_len, k_len, device=device)
+                mask = mask & ~causal_mask
+                causal = False
+
+        # handle alibi positional bias
+        # convert from bool to float
+
+        if exists(attn_bias):
+            attn_bias = rearrange(attn_bias, "h i j -> 1 h i j").expand(
+                batch, heads, -1, -1
+            )
+
+            # if mask given, the mask would already contain the causal mask from above logic
+            # otherwise, if no mask given but still causal, mask out alibi positional bias to a large negative number
+
+            mask_value = -torch.finfo(q.dtype).max
+
+            if exists(mask):
+                attn_bias = attn_bias.masked_fill(~mask, mask_value // 2)
+            elif causal:
+                causal_mask = self.create_causal_mask(q_len, k_len, device=device)
+                attn_bias = attn_bias.masked_fill(causal_mask, mask_value // 2)
+                causal = False
+
+            # scaled_dot_product_attention handles attn_mask either as bool or additive bias
+            # make it an additive bias here
+
+            mask = attn_bias
+
+        # Check if there is a compatible device for flash attention
+
+        config = self.cuda_config if is_cuda else self.cpu_config
+
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
 
-        try:
-            raise Exception()
-            with torch.backends.cuda.sdp_kernel(**self.cuda_config._asdict()):
-                out = F.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=mask,
-                    dropout_p=self.dropout if self.training else 0.0,
-                )
-        except:
-            print_once(
-                "no hardware detected, falling back to naive implementation from memory-efficient-attention-pytorch library"
+        with torch.backends.cuda.sdp_kernel(**config._asdict()):
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=causal,
             )
-            self.no_hardware_detected = True
-
-            out = FlashAttentionFunction.apply(q, k, v, mask, False, 512, 512)
 
         return out
 
-    def forward(self, q, k, v, mask=None, force_non_flash=False):
+    def forward(self, q, k, v, mask=None, attn_bias=None):
         """
         einstein notation
         b - batch
@@ -172,26 +183,140 @@ class Attend(nn.Module):
         d - feature dimension
         """
 
-        if self.flash and not force_non_flash:
-            return self.flash_attn(q, k, v, mask=mask)
+        n, heads, kv_heads, device = q.shape[-2], q.shape[1], k.shape[1], q.device
 
-        # similarity
+        scale = default(self.scale, q.shape[-1] ** -0.5)
 
-        sim = einsum("b h i d, b h j d -> b h i j", q, k) * self.scale
+        # handle grouped multi-query attention
 
-        # masking
+        if kv_heads == 1:
+            k, v = map(lambda t: rearrange(t, "b 1 n d -> b n d"), (k, v))
+        elif kv_heads < heads:
+            k, v = map(
+                lambda t: repeat(t, "b kvh n d -> b (r kvh) n d", r=heads // kv_heads),
+                (k, v),
+            )
+
+        if self.flash:
+            return self.flash_attn(q, k, v, mask=mask, attn_bias=attn_bias)
+
+        kv_einsum_eq = "b j d" if k.ndim == 3 else "b h j d"
+
+        dots = einsum(f"b h i d, {kv_einsum_eq} -> b h i j", q, k) * scale
+
+        qk_similarities = dots.clone()
+
+        if exists(attn_bias):
+            dots = dots + attn_bias
+
+        i, j, dtype = *dots.shape[-2:], dots.dtype
+
+        mask_value = -torch.finfo(dots.dtype).max
 
         if exists(mask):
-            mask_value = -torch.finfo(sim.dtype).max
-            sim = sim.masked_fill(~mask, mask_value)
+            dots = dots.masked_fill(~mask, mask_value)
 
-        # attention
+        if self.causal:
+            causal_mask = self.create_causal_mask(i, j, device=device)
+            dots = dots.masked_fill(causal_mask, mask_value)
 
-        attn = sim.softmax(dim=-1)
+        pre_softmax_attn = dots.clone()
+
+        attn = self.attn_fn(dots, dim=-1)
+        attn = attn.type(dtype)
+
+        post_softmax_attn = attn.clone()
+
         attn = self.attn_dropout(attn)
 
-        # aggregate values
-
-        out = einsum("b h i j, b h j d -> b h i d", attn, v)
+        out = einsum(f"b h i j, {kv_einsum_eq} -> b h i d", attn, v)
 
         return out
+
+
+class Attention(nn.Module):
+    def __init__(
+        self,
+        params: AttentionParams,
+    ):
+        super().__init__()
+        self.dim = params.dim
+        self.dim_head = params.dim_head
+        self.scale = self.dim_head**-0.5
+        self.heads = params.heads
+        inner_dim = self.dim_head * self.heads
+        self.causal = params.causal
+        self.norm = LayerNorm(self.dim)
+        self.qk_norm = params.qk_norm
+        self.qk_norm_scale = params.qk_norm_scale
+        self.add_null_kv = params.add_null_kv
+
+        self.cross_attn_tokens_dropout = params.cross_attn_tokens_dropout
+
+        self.attend = Attend(
+            flash=params.flash,
+            dropout=params.dropout,
+            scale=self.qk_norm_scale if self.qk_norm else self.scale,
+            causal=self.causal,
+            qk_norm=self.qk_norm,
+        )
+
+        self.null_kv = nn.Parameter(torch.randn(2, self.heads, 1, self.dim_head))
+
+        self.to_q = nn.Linear(self.dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(self.dim, inner_dim * 2, bias=False)
+
+        self.q_scale = nn.Parameter(torch.ones(self.dim_head))
+        self.k_scale = nn.Parameter(torch.ones(self.dim_head))
+
+        self.to_out = nn.Linear(inner_dim, self.dim, bias=False)
+
+    def forward(self, x, mask=None, context=None, context_mask=None, rel_pos=None):
+        n = x.shape[-2]
+        h, has_context = self.heads, exists(context)
+
+        if self.training and self.cross_attn_tokens_dropout > 0.0:
+            context, context_mask = dropout_seq(
+                context, context_mask, self.cross_attn_tokens_dropout
+            )
+
+        input_mask = context_mask if has_context else mask
+
+        if exists(input_mask):
+            input_mask = rearrange(input_mask, "b j -> b 1 1 j")
+
+        x = self.norm(x)
+
+        kv_input = default(context, x)
+
+        q, k, v = (self.to_q(x), *self.to_kv(kv_input).chunk(2, dim=-1))
+
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
+
+        if self.add_null_kv:
+            nk, nv = self.null_kv
+            nk, nv = map(
+                lambda t: repeat(t, "h 1 d -> b h 1 d", b=x.shape[0]), (nk, nv)
+            )
+
+            k = torch.cat((nk, k), dim=-2)
+            v = torch.cat((nv, v), dim=-2)
+
+            input_mask = repeat(input_mask, "b 1 1 j -> b h i j", h=h, i=n)
+
+            input_mask = F.pad(input_mask, (1, 0), value=True)
+
+        if self.qk_norm:
+            q, k = map(l2norm, (q, k))
+            q = q * self.q_scale
+            k = k * self.k_scale
+
+        i, j = map(lambda t: t.shape[-2], (q, k))
+        attn_bias = None
+        if exists(rel_pos):
+            attn_bias = rel_pos(i, j)
+
+        out = self.attend(q, k, v, mask=input_mask, attn_bias=attn_bias)
+
+        out = rearrange(out, "b h n d -> b n (h d)")
+        return self.to_out(out)

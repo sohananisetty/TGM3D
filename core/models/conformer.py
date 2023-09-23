@@ -1,25 +1,9 @@
 import torch
-from torch import nn, einsum
 import torch.nn.functional as F
-
+from core.models.utils import calc_same_padding, default, exists
 from einops import rearrange
 from einops.layers.torch import Rearrange
-
-# helper functions
-
-
-def exists(val):
-    return val is not None
-
-
-def default(val, d):
-    return val if exists(val) else d
-
-
-def calc_same_padding(kernel_size):
-    pad = kernel_size // 2
-    return (pad, pad - (kernel_size + 1) % 2)
-
+from torch import einsum, nn
 
 # helper classes
 
@@ -217,7 +201,7 @@ class ConformerBlock(nn.Module):
         attn_dropout=0.0,
         ff_dropout=0.0,
         conv_dropout=0.0,
-        conv_causal=False
+        conv_causal=False,
     ):
         super().__init__()
         self.ff1 = FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout)
@@ -265,7 +249,7 @@ class Conformer(nn.Module):
         attn_dropout=0.0,
         ff_dropout=0.0,
         conv_dropout=0.0,
-        conv_causal=False
+        conv_causal=False,
     ):
         super().__init__()
         self.dim = dim

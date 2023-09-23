@@ -1,134 +1,35 @@
 import math
 import pathlib
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from random import random
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-from beartype import beartype
-from einops import rearrange, repeat
-from core.models.muse.attend import (
-    Attend,
-    ScaledSinusoidalEmbedding,
-    AbsolutePositionalEmbedding,
-)
 from core.models.conv_vqvae import ConvVQMotionModel
-from core.models.muse.t5 import t5_encode_text, get_encoded_dim, DEFAULT_T5_NAME
-
+from core.models.muse.attend import Attend, AttentionParams
+from core.models.muse.positional_embeddings import (
+    PositionalEmbeddingParams,
+    PositionalEmbeddingType,
+)
+from core.models.muse.t5 import DEFAULT_T5_NAME, get_encoded_dim, t5_encode_text
+from core.models.utils import (
+    AdaIN,
+    FeedForward,
+    LayerNorm,
+    default,
+    dropout_seq,
+    eval_decorator,
+    exists,
+    get_mask_subset_prob,
+    l2norm,
+)
+from einops import rearrange, repeat
 from torch import einsum, nn
 from tqdm.auto import tqdm
-
-# helpers
-
-
-def exists(val):
-    return val is not None
-
-
-def default(val, d):
-    return val if exists(val) else d
-
-
-def eval_decorator(fn):
-    def inner(model, *args, **kwargs):
-        was_training = model.training
-        model.eval()
-        out = fn(model, *args, **kwargs)
-        model.train(was_training)
-        return out
-
-    return inner
-
-
-def l2norm(t):
-    return F.normalize(t, dim=-1)
-
-
-def max_neg_value(tensor):
-    return -torch.finfo(tensor.dtype).max
-
-
-# tensor helpers
-def dropout_seq(seq, mask, dropout):
-    b, n, *_, device = *seq.shape, seq.device
-    logits = torch.randn(b, n, device=device)
-
-    if exists(mask):
-        mask_value = max_neg_value(logits)
-        logits = logits.masked_fill(~mask, mask_value)
-
-    keep_prob = 1.0 - dropout
-    num_keep = max(1, int(keep_prob * n))
-    keep_indices = logits.topk(num_keep, dim=1).indices
-
-    batch_indices = torch.arange(b, device=device)
-    batch_indices = rearrange(batch_indices, "b -> b 1")
-
-    seq = seq[batch_indices, keep_indices]
-
-    if exists(mask):
-        seq_counts = mask.sum(dim=-1)
-        seq_keep_counts = torch.ceil(seq_counts * keep_prob).int()
-        keep_mask = torch.arange(num_keep, device=device) < rearrange(
-            seq_keep_counts, "b -> b 1"
-        )
-
-        mask = mask[batch_indices, keep_indices] & keep_mask
-
-    return seq, mask
-
-
-def get_mask_subset_prob(mask, prob, min_mask=0):
-    batch, seq, device = *mask.shape, mask.device
-    num_to_mask = (mask.sum(dim=-1, keepdim=True) * prob).clamp(min=min_mask)
-    logits = torch.rand((batch, seq), device=device)
-    logits = logits.masked_fill(~mask, -1)
-
-    randperm = logits.argsort(dim=-1).float()
-
-    num_padding = (~mask).sum(dim=-1, keepdim=True)
-    randperm -= num_padding
-
-    subset_mask = randperm < num_to_mask
-    subset_mask.masked_fill_(~mask, False)
-    return subset_mask
-
-
-# classes
-
-
-class LayerNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(dim))
-        self.register_buffer("beta", torch.zeros(dim))
-
-    def forward(self, x):
-        return F.layer_norm(x, x.shape[-1:], self.gamma, self.beta)
-
-
-class GEGLU(nn.Module):
-    """https://arxiv.org/abs/2002.05202"""
-
-    def forward(self, x):
-        x, gate = x.chunk(2, dim=-1)
-        return gate * F.gelu(x)
-
-
-def FeedForward(dim, mult=4):
-    """https://arxiv.org/abs/2110.09456"""
-
-    inner_dim = int(dim * mult * 2 / 3)
-    return nn.Sequential(
-        LayerNorm(dim),
-        nn.Linear(dim, inner_dim * 2, bias=False),
-        GEGLU(),
-        LayerNorm(inner_dim),
-        nn.Linear(inner_dim, dim, bias=False),
-    )
 
 
 class Attention(nn.Module):
@@ -139,21 +40,33 @@ class Attention(nn.Module):
         heads=8,
         cross_attend=False,
         cross_attn_tokens_dropout=0.0,
-        scale=8,
+        qk_norm_scale=8,
         flash=True,
         dropout=0.0,
+        causal=False,
+        qk_norm=False,
+        add_null_kv=False,
     ):
         super().__init__()
-        self.scale = scale
+        self.scale = dim_head**-0.5
         self.heads = heads
         inner_dim = dim_head * heads
-
+        self.causal = causal
         self.cross_attend = cross_attend
         self.norm = LayerNorm(dim)
+        self.qk_norm = qk_norm
+        self.qk_norm_scale = qk_norm_scale
+        self.add_null_kv = add_null_kv
 
         self.cross_attn_tokens_dropout = cross_attn_tokens_dropout
 
-        self.attend = Attend(flash=flash, dropout=dropout, scale=scale)
+        self.attend = Attend(
+            flash=flash,
+            dropout=dropout,
+            scale=qk_norm_scale if qk_norm else self.scale,
+            causal=causal,
+            qk_norm=qk_norm,
+        )
 
         self.null_kv = nn.Parameter(torch.randn(2, heads, 1, dim_head))
 
@@ -165,16 +78,21 @@ class Attention(nn.Module):
 
         self.to_out = nn.Linear(inner_dim, dim, bias=False)
 
-    def forward(self, x, context=None, context_mask=None):
+    def forward(self, x, mask=None, context=None, context_mask=None):
         assert not (exists(context) ^ self.cross_attend)
 
         n = x.shape[-2]
-        h, is_cross_attn = self.heads, exists(context)
+        h, has_context = self.heads, exists(context)
 
         if self.training and self.cross_attn_tokens_dropout > 0.0:
             context, context_mask = dropout_seq(
                 context, context_mask, self.cross_attn_tokens_dropout
             )
+
+        input_mask = context_mask if has_context else mask
+
+        if exists(input_mask):
+            input_mask = rearrange(input_mask, "b j -> b 1 1 j")
 
         x = self.norm(x)
 
@@ -184,28 +102,32 @@ class Attention(nn.Module):
 
         q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
 
-        nk, nv = self.null_kv
-        nk, nv = map(lambda t: repeat(t, "h 1 d -> b h 1 d", b=x.shape[0]), (nk, nv))
+        if self.add_null_kv:
+            nk, nv = self.null_kv
+            nk, nv = map(
+                lambda t: repeat(t, "h 1 d -> b h 1 d", b=x.shape[0]), (nk, nv)
+            )
 
-        k = torch.cat((nk, k), dim=-2)
-        v = torch.cat((nv, v), dim=-2)
+            k = torch.cat((nk, k), dim=-2)
+            v = torch.cat((nv, v), dim=-2)
 
-        q, k = map(l2norm, (q, k))
-        q = q * self.q_scale
-        k = k * self.k_scale
+            input_mask = repeat(input_mask, "b 1 1 j -> b h i j", h=h, i=n)
 
-        if exists(context_mask):
-            context_mask = repeat(context_mask, "b j -> b h i j", h=h, i=n)
-            context_mask = F.pad(context_mask, (1, 0), value=True)
+            input_mask = F.pad(input_mask, (1, 0), value=True)
 
-        out = self.attend(q, k, v, mask=context_mask)
+        if self.qk_norm:
+            q, k = map(l2norm, (q, k))
+            q = q * self.q_scale
+            k = k * self.k_scale
+
+        out = self.attend(q, k, v, mask=input_mask)
 
         out = rearrange(out, "b h n d -> b n (h d)")
         return self.to_out(out)
 
 
 class TransformerBlocks(nn.Module):
-    def __init__(self, *, dim, depth, dim_head=64, heads=8, ff_mult=4, flash=True):
+    def __init__(self, attention_params: AttentionParams, depth: int, ff_mult: int = 4):
         super().__init__()
         self.layers = nn.ModuleList([])
 
@@ -213,28 +135,30 @@ class TransformerBlocks(nn.Module):
             self.layers.append(
                 nn.ModuleList(
                     [
-                        Attention(dim=dim, dim_head=dim_head, heads=heads, flash=flash),
-                        Attention(
-                            dim=dim,
-                            dim_head=dim_head,
-                            heads=heads,
-                            cross_attend=True,
-                            flash=flash,
-                        ),
-                        FeedForward(dim=dim, mult=ff_mult),
+                        Attention(attention_params),
+                        Attention(attention_params),
+                        FeedForward(dim=attention_params.dim, mult=ff_mult),
+                        AdaIN(dim=attention_params.dim),
+                        FeedForward(dim=attention_params.dim, mult=ff_mult),
                     ]
                 )
             )
 
-        self.norm = LayerNorm(dim)
+        self.norm = LayerNorm(attention_params.dim)
 
-    def forward(self, x, context=None, context_mask=None):
-        for attn, cross_attn, ff in self.layers:
-            x = attn(x) + x
+    def forward(
+        self, x, mask=None, context=None, context_mask=None, style=None, rel_pos=None
+    ):
+        for attn, cross_attn, ff1, adain, ff2 in self.layers:
+            x = attn(x, mask=mask, rel_pos=rel_pos) + x
 
-            x = cross_attn(x, context=context, context_mask=context_mask) + x
+            x = cross_attn(x, mask=mask, context=context, context_mask=context_mask) + x
 
-            x = ff(x) + x
+            x = ff1(x) + x
+
+            x = adain(x, style=style)
+
+            x = ff2(x) + x
 
         return self.norm(x)
 
@@ -242,75 +166,122 @@ class TransformerBlocks(nn.Module):
 # transformer - it's all we need
 
 
+@dataclass
+class TransformerParams:
+    attention_params: AttentionParams
+    positional_embedding_params: PositionalEmbeddingParams
+    positional_embedding: PositionalEmbeddingType
+    num_tokens: int = 1024
+    dim_out: int = None
+    depth: int = 12
+    ff_mult: int = 4
+    self_cond: bool = False
+    add_mask_id: bool = True
+    emb_dropout = 0.0
+    post_emb_norm = False
+    context_types = List[str] = ["text"]
+    context_dim: List[int] = [768]
+    style_dim: int = 768
+
+
 class Transformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        num_tokens,
-        dim,
-        music_dim,
-        seq_len,
-        dim_out=None,
-        scaled_sinu_pos_emb=False,
-        self_cond=False,
-        add_mask_id=False,
-        emb_dropout=0.0,
-        post_emb_norm=False,
-        **kwargs,
-    ):
+    def __init__(self, transformer_params: TransformerParams):
         super().__init__()
-        self.dim = dim
-        self.music_dim = music_dim
-        self.mask_id = num_tokens if add_mask_id else None
+        self.dim = transformer_params.attention_params.dim
+        self.num_tokens = transformer_params.num_tokens
+        self.context_types = transformer_params.context_types
+        self.seq_len = transformer_params.positional_embedding_params.max_seq_len
 
-        self.num_tokens = num_tokens
-        self.token_emb = nn.Embedding(num_tokens + int(add_mask_id), dim)
-        if scaled_sinu_pos_emb:
-            self.pos_emb = ScaledSinusoidalEmbedding(dim)
-        else:
-            self.pos_emb = AbsolutePositionalEmbedding(dim, seq_len)
+        self.style_dim = transformer_params.style_dim
+        self.mask_id = self.num_tokens if transformer_params.add_mask_id else None
 
-        self.emb_dropout = nn.Dropout(emb_dropout)
+        self.token_emb = nn.Embedding(
+            self.num_tokens + int(transformer_params.add_mask_id), self.dim
+        )
+
+        self.is_abs_pos_emb = transformer_params.positional_embedding.name in [
+            "ABS",
+            "SINE",
+        ]
+
+        self.pos_emb = transformer_params.positional_embedding(
+            transformer_params.positional_embedding_params
+        )
+
+        self.emb_dropout = nn.Dropout(transformer_params.emb_dropout)
 
         # self.pos_emb = nn.Embedding(seq_len, dim)
-        self.seq_len = seq_len
 
-        self.transformer_blocks = TransformerBlocks(dim=dim, **kwargs)
-        self.norm = LayerNorm(dim)
-
-        self.dim_out = default(dim_out, num_tokens)
-        self.to_logits = nn.Linear(dim, self.dim_out, bias=False)
-
-        # text conditioning
-
-        t5_name = DEFAULT_T5_NAME
-
-        self.encode_text = partial(
-            t5_encode_text, name=t5_name, mask_id=float(self.mask_id)
+        self.transformer_blocks = TransformerBlocks(
+            attention_params=transformer_params.attention_params,
+            depth=transformer_params.depth,
+            ff_mult=transformer_params.ff_mult,
         )
+        self.norm = LayerNorm(self.dim)
 
-        text_embed_dim = get_encoded_dim(t5_name)
+        self.dim_out = default(transformer_params.dim_out, self.num_tokens)
+        self.to_logits = nn.Linear(self.dim, self.dim_out, bias=False)
 
-        self.text_embed_proj = (
-            nn.Linear(text_embed_dim, dim, bias=False)
-            if text_embed_dim != dim
-            else nn.Identity()
-        )
+        self.context_embed_projs = {}
+        for context_dim, context in zip(
+            transformer_params.context_dim, transformer_params.context_types
+        ):
+            self.context_embed_projs[context] = (
+                nn.Linear(context_dim, self.dim, bias=False)
+                if context_dim != self.dim
+                else nn.Identity()
+            )
 
         # context conditioning
 
-        self.music_embed_proj = (
-            nn.Linear(self.music_dim, dim, bias=False)
-            if self.music_dim != dim
+        self.style_embed_proj = (
+            nn.Linear(self.style_dim, self.dim, bias=False)
+            if self.style_dim != self.dim
             else nn.Identity()
         )
 
         # optional self conditioning
 
-        self.self_cond = self_cond
-        self.self_cond_to_init_embed = FeedForward(dim)
+        self.self_cond = transformer_params.self_cond
+        self.self_cond_to_init_embed = FeedForward(self.dim)
 
-        self.post_emb_norm = nn.LayerNorm(dim) if post_emb_norm else nn.Identity()
+        self.post_emb_norm = (
+            nn.LayerNorm(self.dim)
+            if transformer_params.post_emb_norm
+            else nn.Identity()
+        )
+
+    def prepare_inputs(
+        self, x, mask=None, contexts=None, style=None, cond_drop_prob=0.0
+    ):
+        device, b, n = x.device, *x.shape
+
+        if mask is None:
+            mask = (x != self.mask_id).any(dim=-1)
+
+        context = None
+        context_mask = None
+
+        for context_type, context_embeds in contexts.items():
+            new_context = self.context_embed_projs[context_type](context_embeds)
+            new_context_mask = (context_embeds != self.mask_id).any(dim=-1)
+
+            if context is None or context_mask is None:
+                context = new_context
+                context_mask = new_context_mask
+            else:
+                context = torch.cat((context, new_context), dim=-2)
+                context_mask = torch.cat((context_mask, new_context_mask), dim=-2)
+
+        # classifier free guidance
+
+        if cond_drop_prob > 0.0:
+            mask_ = prob_mask_like((b, 1), 1.0 - cond_drop_prob, device)
+            context_mask = context_mask & mask_
+
+        style = self.style_embed_proj(style)
+
+        return mask, context, context_mask, style
 
     def forward_with_cond_scale(
         self, *args, cond_scale=3.0, return_embed=False, **kwargs
@@ -363,16 +334,14 @@ class Transformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        mask: torch.Tensor = None,
+        style: torch.Tensor = None,
         return_embed: bool = False,
         return_logits: bool = False,
         labels=None,
         ignore_index: int = 0,
         self_cond_embed=None,
         cond_drop_prob: float = 0.0,
-        # conditioning_token_ids: Optional[torch.Tensor] = None,
-        # conditioning_token_embed: torch.Tensor = None,
-        # text_embeds: Optional[torch.Tensor] = None,
-        # context_embeds=None,
         context_embeds_dict=None,
         pos: torch.Tensor = None,
         sum_embeds=None,
@@ -380,45 +349,21 @@ class Transformer(nn.Module):
         device, b, n = x.device, *x.shape
         assert n <= self.seq_len
 
-        # context = self.context_embed_proj(context_embeds)
-        # context_mask = (context_embeds != 0).any(dim=-1)
-
-        context = None
-        context_mask = None
-
-        for context_type, context_embeds in context_embeds_dict.items():
-            proj_function = getattr(self, f"{context_type}_embed_proj", nn.Identity)
-
-            new_context = proj_function(context_embeds)
-            new_context_mask = (context_embeds != self.mask_id).any(dim=-1)
-
-            if context is None or context_mask is None:
-                context = new_context
-                context_mask = new_context_mask
-            else:
-                context = torch.cat((context, new_context), dim=-2)
-                context_mask = torch.cat((context_mask, new_context_mask), dim=-2)
-
-        # classifier free guidance
-
-        if self.training and cond_drop_prob > 0.0:
-            mask = prob_mask_like((b, 1), 1.0 - cond_drop_prob, device)
-            context_mask = context_mask & mask
-
-        # concat conditioning image token ids if needed
-
-        # if exists(conditioning_token_ids):
-        #     conditioning_token_ids = rearrange(
-        #         conditioning_token_ids, "b ... -> b (...)"
-        #     )
-        #     cond_token_emb = self.token_emb(conditioning_token_ids)
-        #     context = torch.cat((context, cond_token_emb), dim=-2)
-        #     context_mask = F.pad(
-        #         context_mask, (0, conditioning_token_ids.shape[-1]), value=True
-        #     )
+        mask, context, context_mask, style = self.prepare_inputs(
+            x,
+            mask=mask,
+            contexts=context_embeds_dict,
+            style=style,
+            cond_drop_prob=cond_drop_prob,
+        )
 
         # embed tokens
-        x = self.token_emb(x) + self.pos_emb(x, pos=pos)
+        if self.is_abs_pos_emb:
+            x = self.token_emb(x) + self.pos_emb(x, pos=pos)
+            rel_pos = None
+        else:
+            x = self.token_emb(x)
+            rel_pos = self.pos_emb
 
         if exists(sum_embeds):
             x = x + sum_embeds
@@ -431,7 +376,14 @@ class Transformer(nn.Module):
                 self_cond_embed = torch.zeros_like(x)
             x = x + self.self_cond_to_init_embed(self_cond_embed)
 
-        embed = self.transformer_blocks(x, context=context, context_mask=context_mask)
+        embed = self.transformer_blocks(
+            x,
+            mask=mask,
+            context=context,
+            context_mask=context_mask,
+            style=style,
+            rel_pos=rel_pos,
+        )
 
         logits = self.to_logits(embed)
 
@@ -553,7 +505,6 @@ def cosine_schedule(t):
 # main maskgit classes
 
 
-@beartype
 class MaskGit(nn.Module):
     def __init__(
         self,
@@ -563,8 +514,6 @@ class MaskGit(nn.Module):
         token_critic: Optional[TokenCritic] = None,
         self_token_critic=False,
         vae: Optional[ConvVQMotionModel] = None,
-        cond_vae: Optional[ConvVQMotionModel] = None,
-        cond_image_size=None,
         cond_drop_prob=0.5,
         self_cond_prob=0.9,
         no_mask_token_prob=0.0,
@@ -573,26 +522,14 @@ class MaskGit(nn.Module):
         super().__init__()
         self.vae = vae.copy_for_eval() if exists(vae) else None
 
-        if exists(cond_vae):
-            self.cond_vae = cond_vae.eval()
-        else:
-            self.cond_vae = self.vae
-
-        assert not (
-            exists(cond_vae) and not exists(cond_image_size)
-        ), "cond_image_size must be specified if conditioning"
-
         self.image_size = image_size
-        self.cond_image_size = cond_image_size
 
         self.cond_drop_prob = cond_drop_prob
 
         self.transformer = transformer
         self.self_cond = transformer.self_cond
         assert (
-            self.vae.codebook_size
-            == self.cond_vae.codebook_size
-            == transformer.num_tokens
+            self.vae.codebook_size == transformer.num_tokens
         ), "transformer num_tokens must be set to be equal to the vae codebook size"
 
         self.mask_id = transformer.mask_id
@@ -788,13 +725,16 @@ class MaskGit(nn.Module):
     def forward(
         self,
         ids: torch.Tensor,
-        ignore_index=-1,
-        cond_token_ids: Optional[torch.Tensor] = None,
-        texts: Optional[List[str]] = None,
-        text_embeds: Optional[torch.Tensor] = None,
-        cond_drop_prob=None,
-        train_only_generator=False,
-        sample_temperature=None,
+        ignore_index: int = -1,
+        context_texts: Optional[List[str]] = None,
+        context_text_embeds: Optional[torch.Tensor] = None,
+        context_music: Optional[torch.Tensor] = None,
+        context_music_embeds: Optional[torch.Tensor] = None,
+        style_texts: Optional[List[str]] = None,
+        style_text_embeds: Optional[torch.Tensor] = None,
+        cond_drop_prob: Optional[float] = None,
+        train_only_generator: bool = False,
+        sample_temperature: Optional[float] = None,
     ):
         # get some basic variables
 
@@ -807,17 +747,25 @@ class MaskGit(nn.Module):
 
         mask, labels = self.prepare_mask_and_labels(ids, ignore_index)
 
-        if self.no_mask_token_prob > 0.0:
+        if self.training and self.no_mask_token_prob > 0.0:
             no_mask_mask = get_mask_subset_prob(mask, self.no_mask_token_prob)
             mask &= ~no_mask_mask
 
         x = torch.where(mask, self.mask_id, ids)
 
-        # get text embeddings
+        if exists(context_texts):
+            pass
 
-        if exists(texts):
-            text_embeds = self.transformer.encode_text(texts)
-            texts = None
+        if exists(context_music):
+            pass
+
+        if exists(style_texts):
+            pass
+
+        context_embeds_dict = {
+            "text": context_text_embeds,
+            "music": context_music_embeds,
+        }
 
         # self conditioning
 
@@ -827,8 +775,9 @@ class MaskGit(nn.Module):
             with torch.no_grad():
                 _, self_cond_embed = self.transformer(
                     x,
-                    text_embeds=text_embeds,
-                    conditioning_token_ids=cond_token_ids,
+                    mask=mask,
+                    style=style_text_embeds,
+                    context_embeds_dict=context_embeds_dict,
                     cond_drop_prob=0.0,
                     return_embed=True,
                 )
@@ -839,9 +788,10 @@ class MaskGit(nn.Module):
 
         ce_loss, logits = self.transformer(
             x,
-            text_embeds=text_embeds,
+            mask=mask,
+            style=style_text_embeds,
+            context_embeds_dict=context_embeds_dict,
             self_cond_embed=self_cond_embed,
-            conditioning_token_ids=cond_token_ids,
             labels=labels,
             cond_drop_prob=cond_drop_prob,
             ignore_index=ignore_index,
@@ -862,58 +812,11 @@ class MaskGit(nn.Module):
 
         bce_loss = self.token_critic(
             critic_input,
-            text_embeds=text_embeds,
-            conditioning_token_ids=cond_token_ids,
+            mask=mask,
+            style=style_text_embeds,
+            context_embeds_dict=context_embeds_dict,
             labels=critic_labels,
             cond_drop_prob=cond_drop_prob,
         )
 
         return ce_loss + self.critic_loss_weight * bce_loss
-
-
-# final Muse class
-
-
-# @beartype
-# class Muse(nn.Module):
-#     def __init__(self, base: MaskGit, superres: MaskGit):
-#         super().__init__()
-#         self.base_maskgit = base.eval()
-
-#         assert superres.resize_image_for_cond_image
-#         self.superres_maskgit = superres.eval()
-
-#     @torch.no_grad()
-#     def forward(
-#         self,
-#         texts: List[str],
-#         cond_scale=3.0,
-#         temperature=1.0,
-#         timesteps=18,
-#         superres_timesteps=None,
-#         return_lowres=False,
-#         return_pil_images=True,
-#     ):
-#         lowres_image = self.base_maskgit.generate(
-#             texts=texts,
-#             cond_scale=cond_scale,
-#             temperature=temperature,
-#             timesteps=timesteps,
-#         )
-
-#         superres_image = self.superres_maskgit.generate(
-#             texts=texts,
-#             cond_scale=cond_scale,
-#             cond_images=lowres_image,
-#             temperature=temperature,
-#             timesteps=default(superres_timesteps, timesteps),
-#         )
-
-#         if return_pil_images:
-#             lowres_image = list(map(T.ToPILImage(), lowres_image))
-#             superres_image = list(map(T.ToPILImage(), superres_image))
-
-#         if not return_lowres:
-#             return superres_image
-
-#         return superres_image, lowres_image

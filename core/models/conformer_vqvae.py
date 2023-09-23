@@ -1,14 +1,14 @@
+from typing import Dict, List, Tuple, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
-from typing import Tuple, Dict, Union, List
-
-from core.quantization.vector_quantize import VectorQuantize
-from core.models.seanet import SEANetEncoder, SEANetDecoder
-from core.models.resnet import Resnet1D
 from core.models.conformer import ConformerBlock
+from core.models.resnet import Resnet1D
+from core.models.seanet import SEANetDecoder, SEANetEncoder
+from core.quantization.vector_quantize import VectorQuantize
+from einops import rearrange
 from einops.layers.torch import Rearrange
 
 

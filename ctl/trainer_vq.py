@@ -14,6 +14,7 @@ from accelerate.utils import DistributedDataParallelKwargs
 # from core.datasets import dataset_TM_eval
 from core.datasets.dataset_loading_utils import load_dataset
 from core.datasets.vq_dataset import DATALoader, MotionCollator
+from core.models.conformer_vqvae import ConformerVQMotionModel
 from core.models.conv_vqvae import ConvVQMotionModel
 
 # from core.models.evaluator_wrapper import EvaluatorModelWrapper
@@ -26,8 +27,6 @@ from transformers import AdamW, get_scheduler
 # from utils.eval_trans import evaluation_vqvae, evaluation_vqvae_loss
 from utils.vis_utils.render_final import Renderer
 from yacs.config import CfgNode
-from core.models.conv_vqvae import ConvVQMotionModel
-from core.models.conformer_vqvae import ConformerVQMotionModel
 
 # from utils.word_vectorizer import WordVectorizer
 

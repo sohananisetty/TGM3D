@@ -1,8 +1,16 @@
 import numpy as np
 import scipy.ndimage.filters as filters
 import torch
-from quaternion import (cont6d_to_matrix, cont6d_to_matrix_np, qbetween_np,
-                        qinv_np, qmul, qmul_np, qrot, qrot_np)
+from quaternion import (
+    cont6d_to_matrix,
+    cont6d_to_matrix_np,
+    qbetween_np,
+    qinv_np,
+    qmul,
+    qmul_np,
+    qrot,
+    qrot_np,
+)
 
 t2m_raw_offsets = np.array(
     [

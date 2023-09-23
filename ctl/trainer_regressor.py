@@ -11,15 +11,17 @@ import transformers
 import visualize.plot_3d_global as plot_3d
 import wandb
 from accelerate import Accelerator, DistributedType
-from accelerate.utils import (DistributedDataParallelKwargs,
-                              InitProcessGroupKwargs)
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from core.datasets import dataset_TM_eval
-from core.datasets.vqa_motion_dataset import (DATALoader, MotionCollator,
-                                              MotionCollatorConditional,
-                                              TransMotionDatasetConditional,
-                                              VQMotionDataset,
-                                              VQVarLenMotionDataset,
-                                              VQVarLenMotionDatasetConditional)
+from core.datasets.vqa_motion_dataset import (
+    DATALoader,
+    MotionCollator,
+    MotionCollatorConditional,
+    TransMotionDatasetConditional,
+    VQMotionDataset,
+    VQVarLenMotionDataset,
+    VQVarLenMotionDatasetConditional,
+)
 from core.models.evaluator_wrapper import EvaluatorModelWrapper
 from core.models.loss import ReConsLoss
 from core.models.motion_regressor import MotionRegressorModel, top_k
@@ -32,8 +34,11 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms
 from tqdm import tqdm
 from transformers import AdamW, get_scheduler
-from utils.eval_music import (evaluate_music_motion_trans,
-                              evaluate_music_motion_vqvae, get_target_indices)
+from utils.eval_music import (
+    evaluate_music_motion_trans,
+    evaluate_music_motion_vqvae,
+    get_target_indices,
+)
 from utils.eval_trans import evaluation_vqvae_loss
 from utils.motion_process import recover_from_ric
 from utils.word_vectorizer import WordVectorizer
