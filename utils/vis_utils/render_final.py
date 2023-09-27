@@ -9,7 +9,7 @@ import imageio
 import pyrender
 import torch
 import trimesh
-from core.models.smpl import SMPL
+from core.models.smpl.smpl import SMPL
 from pyrender.constants import RenderFlags
 from shapely import geometry
 from utils import rotation_conversions

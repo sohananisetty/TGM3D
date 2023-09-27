@@ -3,7 +3,7 @@ from typing import List, Tuple
 
 import torch
 import utils.rotation_conversions as geometry
-from core.models.smpl import SMPL
+from music_motion.TGM3D.core.models.smpl.smpl import SMPL
 from scipy.spatial.transform import Rotation as R
 
 # Lower legs

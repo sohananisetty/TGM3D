@@ -38,15 +38,13 @@ class MotionCollator:
         pad_batch_mask = []
         motion_lengths = []
         names = []
-        max_len = max([sample.shape[0] for sample, name in samples])
+        max_len = max([lens for sample, name, lens in samples])
 
-        for inp, name in samples:
+        for inp, name, lens in samples:
             n, d = inp.shape
             diff = max_len - n
-            mask = torch.BoolTensor([1] * n + [0] * diff)
-            padded = torch.concatenate(
-                (torch.tensor(inp), torch.ones((diff, d)) * self.pad)
-            )
+            mask = torch.LongTensor([1] * n + [0] * diff)
+            padded = torch.concatenate((torch.tensor(inp), torch.zeros((diff, d))))
             pad_batch_inputs.append(padded)
             pad_batch_mask.append(mask)
             motion_lengths.append(n)
@@ -68,18 +66,22 @@ class VQMotionDataset(data.Dataset):
         dataset_name: str,
         data_root: str,
         window_size: int = 80,
+        max_motion_seconds=60,
+        enable_var_len=False,
         fps: int = 20,
         split: str = "train",
     ):
         self.fps = fps
 
         self.window_size = window_size
+        self.max_motion_length = max_motion_seconds * fps
         self.dataset_name = dataset_name
         self.split = split
         self.joints_num = 22
+        self.enable_var_len = enable_var_len
 
         if dataset_name == "t2m":
-            self.data_root = os.path.join(data_root, "HumanML3D/HumanML3D_SMPL")
+            self.data_root = os.path.join(data_root, "HumanML3D_SMPL")
             self.motion_dir = os.path.join(self.data_root, "new_joint_vecs")
             self.text_dir = os.path.join(self.data_root, "texts")
 
@@ -95,8 +97,8 @@ class VQMotionDataset(data.Dataset):
 
         joints_num = self.joints_num
 
-        self.mean = np.load(os.path.join(self.data_root, "Mean.npy"))
-        self.std = np.load(os.path.join(self.data_root, "Std.npy"))
+        self.mean = np.load(os.path.join(data_root, "Mean.npy"))
+        self.std = np.load(os.path.join(data_root, "Std.npy"))
 
         split_file = os.path.join(self.data_root, f"{split}.txt")
 
@@ -129,7 +131,21 @@ class VQMotionDataset(data.Dataset):
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, str]:
         motion = self.data[item]
-        window_size = min(self.window_size, (motion).shape[0])
+        prob = random.random()
+
+        if self.enable_var_len and prob < 0.3:
+            if self.max_motion_length < 0:
+                window_size = motion.shape[0]
+            else:
+                window_size = np.random.randint(
+                    self.window_size, min(motion.shape[0], self.max_motion_length)
+                )
+
+        else:
+            if self.window_size == -1:
+                window_size = (motion).shape[0]
+            else:
+                window_size = min(self.window_size, (motion).shape[0])
 
         idx = random.randint(0, (motion).shape[0] - window_size)
 

@@ -99,7 +99,7 @@ class VQVAEMotionTrainer(nn.Module):
         self.output_dir = Path(self.args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.register_buffer("steps", torch.Tensor([0]))
-
+        print(self.vqvae_args)
         self.vqvae_model = ConformerVQMotionModel(
             self.vqvae_args,
         ).to(self.device)
@@ -144,7 +144,7 @@ class VQVAEMotionTrainer(nn.Module):
                 dataset_names=["t2m", "aist", "cm"],
                 args=self.args,
                 split="train",
-                weight_scale=[1, 1, 1],
+                weight_scale=[1.5, 1, 1],
             )
             test_ds, _, _ = load_dataset(
                 dataset_names=["t2m", "aist", "cm"], args=self.args, split="test"
@@ -191,7 +191,7 @@ class VQVAEMotionTrainer(nn.Module):
             collate_fn=collate_fn,
         )
         self.render_dl = DATALoader(
-            self.render_ds, batch_size=1, shuffle=False, collate_fn=collate_fn
+            self.render_ds, batch_size=1, shuffle=False, collate_fn=None
         )
 
         self.dl_iter = cycle(self.dl)
@@ -339,11 +339,12 @@ class VQVAEMotionTrainer(nn.Module):
             batch = next(self.dl_iter)
 
             gt_motion = batch["motion"].to(self.device)
+            mask = batch.get("motion_mask", None)
             # print(self.vqvae_model.device, self.vqvae_model.device)
 
-            pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
-            loss_motion = self.loss_fnc(pred_motion, gt_motion)
-            loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
+            pred_motion, indices, commit_loss = self.vqvae_model(gt_motion, mask)
+            loss_motion = self.loss_fnc(pred_motion, gt_motion, mask)
+            loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion, mask)
             # print(loss_motion.shape, loss_vel.shape, commit_loss.shape)
 
             loss = (
@@ -450,8 +451,9 @@ class VQVAEMotionTrainer(nn.Module):
                 # disable=not self.accelerator.is_main_process,
             ):
                 gt_motion = batch["motion"].to(self.device)
+                mask = batch.get("motion_mask", None)
 
-                pred_motion, indices, commit_loss = self.vqvae_model(gt_motion)
+                pred_motion, indices, commit_loss = self.vqvae_model(gt_motion, mask)
                 # (
                 #     all_pred_motion,
                 #     all_commit_loss,
@@ -461,8 +463,8 @@ class VQVAEMotionTrainer(nn.Module):
                 # )
                 # loss_motion = self.loss_fnc(all_pred_motion, all_gt_motion)
                 # loss_vel = self.loss_fnc.forward_vel(all_pred_motion, all_gt_motion)
-                loss_motion = self.loss_fnc(pred_motion, gt_motion)
-                loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion)
+                loss_motion = self.loss_fnc(pred_motion, gt_motion, mask)
+                loss_vel = self.loss_fnc.forward_vel(pred_motion, gt_motion, mask)
                 loss = (
                     loss_motion
                     + self.vqvae_args.commit * commit_loss
@@ -512,6 +514,7 @@ class VQVAEMotionTrainer(nn.Module):
                 enumerate(self.render_dl),
             ):
                 gt_motion = batch["motion"].to(self.device)
+                mask = batch.get("motion_mask", None)
                 name = str(batch["names"][0])
 
                 curr_dataset_idx = np.searchsorted(dataset_lens, idx + 1)
@@ -520,7 +523,7 @@ class VQVAEMotionTrainer(nn.Module):
 
                 gt_motion = gt_motion[:, :motion_len, :]
 
-                pred_motion, _, _ = self.vqvae_model(gt_motion)
+                pred_motion, _, _ = self.vqvae_model(gt_motion, mask)
 
                 gt_motion = (
                     self.render_ds.datasets[curr_dataset_idx]

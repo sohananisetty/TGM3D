@@ -2,7 +2,7 @@
 import torch
 from utils import rotation_conversions as geometry
 
-from .smpl import JOINTSTYPE_ROOT, SMPL
+from .smpl.smpl import JOINTSTYPE_ROOT, SMPL
 
 # from .get_model import JOINTSTYPES
 JOINTSTYPES = ["a2m", "a2mpl", "smpl", "vibe", "vertices"]

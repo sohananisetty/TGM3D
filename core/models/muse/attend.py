@@ -2,8 +2,7 @@ import math
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from functools import wraps
-from itertools import partial
+from functools import wraps, partial
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +16,8 @@ from core.models.utils import (
     print_once,
 )
 from einops import rearrange, repeat
-from memory_efficient_attention_pytorch.flash_attention import FlashAttentionFunction
+
+# from memory_efficient_attention_pytorch.flash_attention import FlashAttentionFunction
 from packaging import version
 from torch import einsum, nn
 
@@ -37,7 +37,7 @@ class AttentionParams:
     qk_norm: bool = False
     qk_norm_scale: int = 8
     dropout: float = 0.0
-    cross_attn_tokens_dropout: float = (0.0,)
+    cross_attn_tokens_dropout: float = 0.0
     add_null_kv: bool = False
     flash: bool = False
 
@@ -70,109 +70,109 @@ class Attend(nn.Module):
 
         # flash attention
 
-        self.flash = flash
-        assert not (
-            flash and version.parse(torch.__version__) < version.parse("2.0.0")
-        ), "in order to use flash attention, you must be using pytorch 2.0 or above"
+        # self.flash = flash
+        # assert not (
+        #     flash and version.parse(torch.__version__) < version.parse("2.0.0")
+        # ), "in order to use flash attention, you must be using pytorch 2.0 or above"
 
         # determine efficient attention configs for cuda and cpu
 
-        device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
+        # device_properties = torch.cuda.get_device_properties(torch.device("cuda"))
 
-        major, minor = device_properties.major, device_properties.minor
+        # major, minor = device_properties.major, device_properties.minor
 
-        if device_properties.major == 8 and device_properties.minor == 0:
-            print_once(
-                "A100 GPU detected, using flash attention if input tensor is on cuda"
-            )
-            self.cuda_config = AttentionConfig(True, False, False)
-        else:
-            print_once(
-                "Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda"
-            )
-            self.cuda_config = AttentionConfig(False, True, False)
+        # if device_properties.major == 8 and device_properties.minor == 0:
+        #     print_once(
+        #         "A100 GPU detected, using flash attention if input tensor is on cuda"
+        #     )
+        #     self.cuda_config = AttentionConfig(True, False, False)
+        # else:
+        #     print_once(
+        #         "Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda"
+        #     )
+        #     self.cuda_config = AttentionConfig(False, True, False)
 
-    def flash_attn(self, q, k, v, mask=None, attn_bias=None):
-        batch, heads, q_len, _, k_len, is_cuda, device = (
-            *q.shape,
-            k.shape[-2],
-            q.is_cuda,
-            q.device,
-        )
+    # def flash_attn(self, q, k, v, mask=None, attn_bias=None):
+    #     batch, heads, q_len, _, k_len, is_cuda, device = (
+    #         *q.shape,
+    #         k.shape[-2],
+    #         q.is_cuda,
+    #         q.device,
+    #     )
 
-        # Recommended for multi-query single-key-value attention by Tri Dao
-        # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
+    #     # Recommended for multi-query single-key-value attention by Tri Dao
+    #     # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
 
-        if k.ndim == 3:
-            k = rearrange(k, "b ... -> b 1 ...").expand_as(q)
+    #     if k.ndim == 3:
+    #         k = rearrange(k, "b ... -> b 1 ...").expand_as(q)
 
-        if v.ndim == 3:
-            v = rearrange(v, "b ... -> b 1 ...").expand_as(q)
+    #     if v.ndim == 3:
+    #         v = rearrange(v, "b ... -> b 1 ...").expand_as(q)
 
-        # handle scale - by default they scale by dim_head ** -0.5, but need to take care if using cosine sim attention
+    #     # handle scale - by default they scale by dim_head ** -0.5, but need to take care if using cosine sim attention
 
-        if self.qk_norm:
-            default_scale = q.shape[-1] ** -0.5
-            q = q * (default_scale / self.scale)
+    #     if self.qk_norm:
+    #         default_scale = q.shape[-1] ** -0.5
+    #         q = q * (default_scale / self.scale)
 
-        # Check if mask exists and expand to compatible shape
-        # The mask is B L, so it would have to be expanded to B H N L
+    #     # Check if mask exists and expand to compatible shape
+    #     # The mask is B L, so it would have to be expanded to B H N L
 
-        causal = self.causal
+    #     causal = self.causal
 
-        if exists(mask):
-            assert mask.ndim == 4
-            mask = mask.expand(batch, heads, q_len, k_len)
+    #     if exists(mask):
+    #         assert mask.ndim == 4
+    #         mask = mask.expand(batch, heads, q_len, k_len)
 
-            # manually handle causal mask, if another mask was given
+    #         # manually handle causal mask, if another mask was given
 
-            if causal:
-                causal_mask = self.create_causal_mask(q_len, k_len, device=device)
-                mask = mask & ~causal_mask
-                causal = False
+    #         if causal:
+    #             causal_mask = self.create_causal_mask(q_len, k_len, device=device)
+    #             mask = mask & ~causal_mask
+    #             causal = False
 
-        # handle alibi positional bias
-        # convert from bool to float
+    #     # handle alibi positional bias
+    #     # convert from bool to float
 
-        if exists(attn_bias):
-            attn_bias = rearrange(attn_bias, "h i j -> 1 h i j").expand(
-                batch, heads, -1, -1
-            )
+    #     if exists(attn_bias):
+    #         attn_bias = rearrange(attn_bias, "h i j -> 1 h i j").expand(
+    #             batch, heads, -1, -1
+    #         )
 
-            # if mask given, the mask would already contain the causal mask from above logic
-            # otherwise, if no mask given but still causal, mask out alibi positional bias to a large negative number
+    #         # if mask given, the mask would already contain the causal mask from above logic
+    #         # otherwise, if no mask given but still causal, mask out alibi positional bias to a large negative number
 
-            mask_value = -torch.finfo(q.dtype).max
+    #         mask_value = -torch.finfo(q.dtype).max
 
-            if exists(mask):
-                attn_bias = attn_bias.masked_fill(~mask, mask_value // 2)
-            elif causal:
-                causal_mask = self.create_causal_mask(q_len, k_len, device=device)
-                attn_bias = attn_bias.masked_fill(causal_mask, mask_value // 2)
-                causal = False
+    #         if exists(mask):
+    #             attn_bias = attn_bias.masked_fill(~mask, mask_value // 2)
+    #         elif causal:
+    #             causal_mask = self.create_causal_mask(q_len, k_len, device=device)
+    #             attn_bias = attn_bias.masked_fill(causal_mask, mask_value // 2)
+    #             causal = False
 
-            # scaled_dot_product_attention handles attn_mask either as bool or additive bias
-            # make it an additive bias here
+    #         # scaled_dot_product_attention handles attn_mask either as bool or additive bias
+    #         # make it an additive bias here
 
-            mask = attn_bias
+    #         mask = attn_bias
 
-        # Check if there is a compatible device for flash attention
+    #     # Check if there is a compatible device for flash attention
 
-        config = self.cuda_config if is_cuda else self.cpu_config
+    #     config = self.cuda_config if is_cuda else self.cpu_config
 
-        # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
+    #     # pytorch 2.0 flash attn: q, k, v, mask, dropout, causal, softmax_scale
 
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
-            out = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=causal,
-            )
+    #     with torch.backends.cuda.sdp_kernel(**config._asdict()):
+    #         out = F.scaled_dot_product_attention(
+    #             q,
+    #             k,
+    #             v,
+    #             attn_mask=mask,
+    #             dropout_p=self.dropout if self.training else 0.0,
+    #             is_causal=causal,
+    #         )
 
-        return out
+    #     return out
 
     def forward(self, q, k, v, mask=None, attn_bias=None):
         """
@@ -197,8 +197,8 @@ class Attend(nn.Module):
                 (k, v),
             )
 
-        if self.flash:
-            return self.flash_attn(q, k, v, mask=mask, attn_bias=attn_bias)
+        # if self.flash:
+        #     return self.flash_attn(q, k, v, mask=mask, attn_bias=attn_bias)
 
         kv_einsum_eq = "b j d" if k.ndim == 3 else "b h j d"
 

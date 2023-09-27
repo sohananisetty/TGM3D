@@ -28,7 +28,7 @@ class ShawRelativePositionalEmbedding(nn.Module):
         self.max_seq_len = params.max_seq_len
         self.rel_pos_emb = nn.Embedding(2 * params.max_seq_len + 1, params.dim)
 
-    def forward(self, q, pos=None):
+    def forward(self, q, k):
         b, h, n, d = q.shape
         seq = torch.arange(n, device=q.device)
         dist = rearrange(seq, "i -> i ()") - rearrange(seq, "j -> () j")

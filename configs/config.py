@@ -32,7 +32,7 @@ cfg.eval_model_path = os.path.join(
 
 
 cfg.dataset = CN()
-cfg.dataset.dataset_name = "t2m"  # "t2m or kit or aist"
+cfg.dataset.dataset_name = "t2m"  # "t2m or kit or aist or mix"
 cfg.dataset.var_len = False
 cfg.dataset.dataset_root = "/srv/hays-lab/scratch/sanisetty3/music_motion"
 cfg.dataset.music_folder = "music"
@@ -71,8 +71,8 @@ cfg.train.use_mixture = False
 
 cfg.vqvae = CN()
 
-cfg.vqvae.nb_joints = 22 if cfg.dataset.dataset_name == "t2m" else 21
-cfg.vqvae.motion_dim = 263  #'Input motion dimension dimension'
+cfg.vqvae.nb_joints = 22
+cfg.vqvae.motion_dim = 271  #'Input motion dimension dimension'
 cfg.vqvae.enc_dec_dim = 768  #'Encoder and Decoder dimension'
 cfg.vqvae.depth = 12
 cfg.vqvae.heads = 8
@@ -85,11 +85,7 @@ cfg.vqvae.loss_vel = 1.0
 cfg.vqvae.loss_motion = 1.0
 cfg.vqvae.recons_loss = "l1_smooth"  # l1_smooth , l1 , l2
 cfg.vqvae.window_size = 64
-cfg.vqvae.max_length_seconds = 3.2
-cfg.vqvae.min_length_seconds = 3
-cfg.vqvae.max_seq_length = cfg.vqvae.max_length_seconds * cfg.dataset.fps
-cfg.vqvae.use_positional_vqvae_decoder = False
-
+cfg.vqvae.max_length_seconds = 30
 
 ##conv
 cfg.vqvae.down_sampling_ratio = 4

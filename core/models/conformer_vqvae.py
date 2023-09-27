@@ -1,4 +1,4 @@
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple, Union, Optional
 
 import numpy as np
 import torch
@@ -27,12 +27,13 @@ class Encoder(nn.Module):
     ):
         super().__init__()
 
-        blocks = []
-        blocks.append(nn.Conv1d(input_dim, dim, 3, 1, 1))
-        blocks.append(nn.SiLU())
+        self.blocks = []
+        self.layers = nn.ModuleList([])
+        self.blocks.append(nn.Conv1d(input_dim, dim, 3, 1, 1))
+        self.blocks.append(nn.SiLU())
 
         for i in range(int(np.log2(down_sampling_ratio))):
-            blocks.append(
+            self.blocks.append(
                 Rearrange("b c n -> b n c"),
             )
             for _ in range(depth):
@@ -46,25 +47,39 @@ class Encoder(nn.Module):
                     ff_dropout=dropout,
                     conv_dropout=dropout,
                 )
-            blocks.append(block)
-            blocks.append(
+            self.blocks.append(block)
+            self.blocks.append(
                 Rearrange("b n c -> b c n"),
             )
-            blocks.append(
+            self.blocks.append(
                 nn.Conv1d(dim, dim, 3, 2, 1),
             )
-        blocks.append(nn.Conv1d(dim, output_dim, 3, 1, 1))
-        self.model = nn.Sequential(*blocks)
+        self.blocks.append(nn.Conv1d(dim, output_dim, 3, 1, 1))
+        self.model = nn.Sequential(*self.blocks)
 
-    def forward(self, x, need_transpose=False):
+    def forward(self, x, mask=None, need_transpose=False):
         if need_transpose:
             x = rearrange(x, "b n d -> b d n")
-        out = self.model(x)
+
+        if mask is not None:
+            for l in self.blocks:
+                if isinstance(l, ConformerBlock):
+                    x = l(x, mask.bool()).float()
+                    mask = torch.nn.functional.max_pool1d(
+                        mask.float(), 3, stride=2, padding=1
+                    )
+                else:
+                    x = l(x.float())
+
+            out = x
+
+        else:
+            out = self.model(x)
 
         if need_transpose:
             out = rearrange(out, "b d n -> b n d")
 
-        return out
+        return out, mask
 
 
 class Decoder(nn.Module):
@@ -82,12 +97,12 @@ class Decoder(nn.Module):
     ):
         super().__init__()
 
-        blocks = []
-        blocks.append(nn.Conv1d(output_dim, dim, 3, 1, 1))
-        blocks.append(nn.SiLU())
+        self.blocks = []
+        self.blocks.append(nn.Conv1d(output_dim, dim, 3, 1, 1))
+        self.blocks.append(nn.SiLU())
 
         for i in range(int(np.log2(up_sampling_ratio))):
-            blocks.append(
+            self.blocks.append(
                 Rearrange("b c n -> b n c"),
             )
             for _ in range(depth):
@@ -101,21 +116,38 @@ class Decoder(nn.Module):
                     ff_dropout=dropout,
                     conv_dropout=dropout,
                 )
-            blocks.append(block)
-            blocks.append(
+            self.blocks.append(block)
+            self.blocks.append(
                 Rearrange("b n c -> b c n"),
             )
-            blocks.append(nn.Upsample(scale_factor=2, mode="nearest"))
-            blocks.append(
+            self.blocks.append(nn.Upsample(scale_factor=2, mode="nearest"))
+            self.blocks.append(
                 nn.Conv1d(dim, dim, 3, 1, 1),
             )
-        blocks.append(nn.Conv1d(dim, input_dim, 3, 1, 1))
-        self.model = nn.Sequential(*blocks)
+        self.blocks.append(nn.Conv1d(dim, input_dim, 3, 1, 1))
+        self.model = nn.Sequential(*self.blocks)
 
-    def forward(self, x, need_transpose=False):
+    def forward(self, x, mask=None, need_transpose=False):
         if need_transpose:
             x = rearrange(x, "b n d -> b d n")
-        out = self.model(x)
+        if mask is not None:
+            i = 0
+            for l in self.blocks:
+                if isinstance(l, ConformerBlock):
+                    mask_ = torch.nn.functional.max_pool1d(
+                        mask.float(), 3, stride=2 ** (2 - i), padding=1
+                    )
+                    x = l(x, mask_.bool())
+
+                    i += 1
+                else:
+                    x = l(x.float())
+
+            out = x
+            mask = mask.bool()
+
+        else:
+            out = self.model(x)
 
         if need_transpose:
             out = rearrange(out, "b d n -> b n d")
@@ -137,7 +169,7 @@ class ConformerVQMotionModel(nn.Module):
         super(ConformerVQMotionModel, self).__init__()
 
         self.device = device
-        self.dim = args.motion_dim
+        self.dim = args.enc_dec_dim
 
         self.motionEncoder = Encoder(
             input_dim=args.motion_dim,
@@ -171,8 +203,14 @@ class ConformerVQMotionModel(nn.Module):
             sync_codebook=False,
         )
 
+    def load(self, path):
+        pkg = torch.load(str(path), map_location="cuda")
+        self.vq._codebook.batch_mean = pkg["model"]["vq._codebook.batch_mean"]
+        self.vq._codebook.batch_variance = pkg["model"]["vq._codebook.batch_variance"]
+        self.load_state_dict(pkg["model"])
+
     def forward(
-        self, motion: torch.Tensor
+        self, motion: torch.Tensor, mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Predict sequences from inputs.
 
@@ -189,16 +227,20 @@ class ConformerVQMotionModel(nn.Module):
         # Computes motion features.
         motion_input = motion  # b n d
 
-        embed_motion_features = self.motionEncoder(motion_input, True)  # b n d
+        embed_motion_features, mask_downsampled = self.motionEncoder(
+            motion_input, mask, True
+        )  # b n d
 
         ##codebook
-        quantized_enc_motion, indices, commit_loss = self.vq(embed_motion_features)
+        quantized_enc_motion, indices, commit_loss = self.vq(
+            embed_motion_features, mask_downsampled
+        )
 
         # b n d , b n/4 , q
 
         ## decoder
         decoded_motion_features = self.motionDecoder(
-            quantized_enc_motion, True
+            quantized_enc_motion, mask, True
         )  # b n d
 
         # print(commit_loss.shape)
@@ -206,16 +248,22 @@ class ConformerVQMotionModel(nn.Module):
 
         return decoded_motion_features, indices, commit_loss.sum()
 
-    def encode(self, motion_input):
+    def encode(self, motion_input, mask=None):
         with torch.no_grad():
-            embed_motion_features = self.motionEncoder(motion_input)
-            quantized_enc_motion, indices, commit_loss = self.vq(embed_motion_features)
+            embed_motion_features, mask_downsampled = self.motionEncoder(
+                motion_input, mask, True
+            )  # b n d
+
+            ##codebook
+            quantized_enc_motion, indices, commit_loss = self.vq(
+                embed_motion_features, mask_downsampled
+            )
             return indices
 
-    def decode(self, indices):
+    def decode(self, indices, mask=None):
         with torch.no_grad():
             quantized = self.vq.get_codes_from_indices(indices).reshape(
-                quantized.shape[0], -1, self.dim
+                indices.shape[0], -1, self.dim
             )
-            out_motion = self.motionDecoder(quantized)
-            return quantized, out_motion
+            decoded_motion_features = self.motionDecoder(quantized, mask, True)  # b n d
+            return quantized, decoded_motion_features

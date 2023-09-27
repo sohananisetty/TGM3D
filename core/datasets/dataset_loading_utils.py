@@ -1,17 +1,32 @@
 import itertools
 from typing import Dict, List, Optional
-
+from enum import Enum
 import torch
 
 from .vq_dataset import VQMotionDataset
+
+
+class AIST_GENRE(Enum):
+    GBR = "Break"
+    GPO = "Pop"
+    GLO = "Lock"
+    GMH = "Middle Hip-hop"
+    GLH = "LA style Hip-hop"
+    GHO = "House"
+    GWA = "Waack"
+    GKR = "Krump"
+    GJS = "Street Jazz"
+    GJB = "Ballet Jazz"
 
 
 def load_dataset(
     dataset_names: List[str],
     args: Dict,
     split: str = "train",
-    weight_scale: List[int] = [1, 1, 1],
+    weight_scale: Optional[List[int]] = None,
 ):
+    if weight_scale is None:
+        weight_scale = [1] * len(dataset_names)
     assert len(dataset_names) == len(weight_scale), "mismatch in size"
     dataset_list = []
     weights = []
@@ -21,6 +36,8 @@ def load_dataset(
                 dataset_name,
                 data_root=args.dataset.dataset_root,
                 window_size=args.vqvae.window_size,
+                max_motion_seconds=args.vqvae.max_length_seconds,
+                enable_var_len=args.dataset.var_len,
                 split=split,
             )
         )

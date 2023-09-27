@@ -11,7 +11,7 @@ def main():
 
 
 if __name__ == "__main__":
-    path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/checkpoints/conformer_512_1024_affine/conformer_512_1024_affine.yaml"
+    path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/checkpoints/conformer_768_1024_affine_varlen/conformer_768_1024_affine_varlen.yaml"
     cfg = get_cfg_defaults()
     print("loading config from:", path)
     cfg.merge_from_file(path)

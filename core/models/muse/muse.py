@@ -10,14 +10,17 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from core.models.conv_vqvae import ConvVQMotionModel
-from core.models.muse.attend import Attend, AttentionParams
+from core.models.muse.attend import Attend, AttentionParams, Attention
 from core.models.muse.positional_embeddings import (
     PositionalEmbeddingParams,
     PositionalEmbeddingType,
 )
-from core.models.muse.t5 import DEFAULT_T5_NAME, get_encoded_dim, t5_encode_text
+from music_motion.TGM3D.core.models.pretrained_encoders.t5 import (
+    DEFAULT_T5_NAME,
+    get_encoded_dim,
+    t5_encode_text,
+)
 from core.models.utils import (
-    AdaIN,
     FeedForward,
     LayerNorm,
     default,
@@ -32,98 +35,24 @@ from torch import einsum, nn
 from tqdm.auto import tqdm
 
 
-class Attention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        dim_head=64,
-        heads=8,
-        cross_attend=False,
-        cross_attn_tokens_dropout=0.0,
-        qk_norm_scale=8,
-        flash=True,
-        dropout=0.0,
-        causal=False,
-        qk_norm=False,
-        add_null_kv=False,
-    ):
+class AdaIn(nn.Module):
+    """
+    adaptive instance normalization
+    """
+
+    def __init__(self, dim):
         super().__init__()
-        self.scale = dim_head**-0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
-        self.causal = causal
-        self.cross_attend = cross_attend
-        self.norm = LayerNorm(dim)
-        self.qk_norm = qk_norm
-        self.qk_norm_scale = qk_norm_scale
-        self.add_null_kv = add_null_kv
+        self.norm = nn.InstanceNorm1d(dim)
 
-        self.cross_attn_tokens_dropout = cross_attn_tokens_dropout
-
-        self.attend = Attend(
-            flash=flash,
-            dropout=dropout,
-            scale=qk_norm_scale if qk_norm else self.scale,
-            causal=causal,
-            qk_norm=qk_norm,
-        )
-
-        self.null_kv = nn.Parameter(torch.randn(2, heads, 1, dim_head))
-
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
-
-        self.q_scale = nn.Parameter(torch.ones(dim_head))
-        self.k_scale = nn.Parameter(torch.ones(dim_head))
-
-        self.to_out = nn.Linear(inner_dim, dim, bias=False)
-
-    def forward(self, x, mask=None, context=None, context_mask=None):
-        assert not (exists(context) ^ self.cross_attend)
-
-        n = x.shape[-2]
-        h, has_context = self.heads, exists(context)
-
-        if self.training and self.cross_attn_tokens_dropout > 0.0:
-            context, context_mask = dropout_seq(
-                context, context_mask, self.cross_attn_tokens_dropout
-            )
-
-        input_mask = context_mask if has_context else mask
-
-        if exists(input_mask):
-            input_mask = rearrange(input_mask, "b j -> b 1 1 j")
-
+    def forward(self, x, style=None):
+        if style is None:
+            return x
+        b, n, d = x.shape
+        style_mean = style.mean(1).view(b, 1, d)
+        style_std = (style.var(1) + 1e-8).sqrt().view(b, 1, d)
         x = self.norm(x)
-
-        kv_input = context if self.cross_attend else x
-
-        q, k, v = (self.to_q(x), *self.to_kv(kv_input).chunk(2, dim=-1))
-
-        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> b h n d", h=h), (q, k, v))
-
-        if self.add_null_kv:
-            nk, nv = self.null_kv
-            nk, nv = map(
-                lambda t: repeat(t, "h 1 d -> b h 1 d", b=x.shape[0]), (nk, nv)
-            )
-
-            k = torch.cat((nk, k), dim=-2)
-            v = torch.cat((nv, v), dim=-2)
-
-            input_mask = repeat(input_mask, "b 1 1 j -> b h i j", h=h, i=n)
-
-            input_mask = F.pad(input_mask, (1, 0), value=True)
-
-        if self.qk_norm:
-            q, k = map(l2norm, (q, k))
-            q = q * self.q_scale
-            k = k * self.k_scale
-
-        out = self.attend(q, k, v, mask=input_mask)
-
-        out = rearrange(out, "b h n d -> b n (h d)")
-        return self.to_out(out)
+        x = x * style_std + style_mean
+        return x
 
 
 class TransformerBlocks(nn.Module):
@@ -138,7 +67,7 @@ class TransformerBlocks(nn.Module):
                         Attention(attention_params),
                         Attention(attention_params),
                         FeedForward(dim=attention_params.dim, mult=ff_mult),
-                        AdaIN(dim=attention_params.dim),
+                        AdaIn(dim=attention_params.dim),
                         FeedForward(dim=attention_params.dim, mult=ff_mult),
                     ]
                 )

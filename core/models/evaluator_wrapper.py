@@ -2,8 +2,12 @@ from os.path import join as pjoin
 
 import numpy as np
 import torch
-from core.models.eval_modules import (AISTEncoderBiGRUCo, MotionEncoderBiGRUCo,
-                                      MovementConvEncoder, TextEncoderBiGRUCo)
+from core.models.eval_modules import (
+    AISTEncoderBiGRUCo,
+    MotionEncoderBiGRUCo,
+    MovementConvEncoder,
+    TextEncoderBiGRUCo,
+)
 from utils.word_vectorizer import POS_enumerator
 
 
