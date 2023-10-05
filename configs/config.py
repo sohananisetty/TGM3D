@@ -16,9 +16,11 @@ cfg.abs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 cfg.device = "cuda"
 
 cfg.vqvae_model_name = "vqvae"
+cfg.model_path = "core.models"
+
 cfg.motion_trans_model_name = "trans"
 cfg.extractors_model_name = "aist_extractor_GRU"
-
+cfg.bert_model_name = "bert"
 cfg.pretrained_modelpath = os.path.join(
     cfg.abs_dir, f"checkpoints/{cfg.vqvae_model_name}/vqvae_motion.pt"
 )
@@ -86,6 +88,8 @@ cfg.vqvae.loss_motion = 1.0
 cfg.vqvae.recons_loss = "l1_smooth"  # l1_smooth , l1 , l2
 cfg.vqvae.window_size = 64
 cfg.vqvae.max_length_seconds = 30
+cfg.vqvae.min_length_seconds = 3
+
 
 ##conv
 cfg.vqvae.down_sampling_ratio = 4
@@ -115,7 +119,7 @@ cfg.eval_model = CN()
 cfg.eval_model.device = cfg.device
 cfg.eval_model.dataset_name = "t2m"
 cfg.eval_model.checkpoints_dir = (
-    "/srv/scratch/sanisetty3/music_motion/T2M-GPT/checkpoints"
+    "/srv/hays-lab/scratch/sanisetty3/music_motion/T2M-GPT/checkpoints"
 )
 
 cfg.eval_model.max_text_len = 20
@@ -141,17 +145,18 @@ cfg.eval_model.dim_movement_dec_hidden = 512
 cfg.eval_model.dim_movement_latent = 512
 
 
-cfg.extractor = CN()
-cfg.extractor.motion_input_size = 263
-cfg.extractor.music_input_size = 128
-cfg.extractor.hidden_size = 768
-cfg.extractor.output_size = 128
-cfg.extractor.window_size = 100
-cfg.extractor.max_length_seconds = 30
-cfg.extractor.min_length_seconds = 3
-cfg.extractor.max_seq_length = cfg.extractor.max_length_seconds * cfg.dataset.fps
-cfg.extractor.temperature = 1.0
-cfg.extractor.checkpoint_dir = "/srv/scratch/sanisetty3/music_motion/motion_vqvae/checkpoints/extractors/checkpoints/"
+cfg.bert = CN()
+cfg.bert.dim = 768
+cfg.bert.heads = 8
+cfg.bert.depth = 12
+cfg.bert.num_tokens = 1024
+cfg.bert.window_size = 80
+cfg.bert.loss_nsp = 1.0
+cfg.bert.loss_mlm = 1.0
+cfg.bert.causal = False
+cfg.bert.codebook_size = 1024
+cfg.bert.mask_prob = 0.15
+cfg.bert.max_motion_length = 128
 
 
 def get_cfg_defaults():

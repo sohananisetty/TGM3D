@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 import torch
-from quaternion import (
+from utils.motion_processing.quaternion import (
     qbetween_np,
     qfix,
     qinv,
@@ -13,7 +13,7 @@ from quaternion import (
     quaternion_to_cont6d,
     quaternion_to_cont6d_np,
 )
-from skeleton import Skeleton, t2m_kinematic_chain, t2m_raw_offsets
+from .skeleton import Skeleton, t2m_kinematic_chain, t2m_raw_offsets
 
 l_idx1, l_idx2 = 5, 8
 # Right/Left foot

@@ -3,8 +3,11 @@ from typing import List, Tuple
 
 import torch
 import utils.rotation_conversions as geometry
-from music_motion.TGM3D.core.models.smpl.smpl import SMPL
+from core.models.smpl.smpl import SMPL
 from scipy.spatial.transform import Rotation as R
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 
 # Lower legs
 l_idx1, l_idx2 = 5, 8
@@ -100,6 +103,20 @@ class AISTProcess:
         sml[:, :3] = positions_
 
         return sml
+
+    def resample(self, dat, in_fps=24, out_fps=20):
+        df = pd.DataFrame(dat)
+        df["timestamp"] = pd.date_range(
+            start="2023-08-23 00:00:00",
+            periods=dat.shape[0],
+            freq=f"{round((1/in_fps)*1000 , 4)}ms",
+        )
+        df.set_index("timestamp", inplace=True)
+        resampled_df = df.resample(
+            f"{round((1/out_fps)*1000 , 5)}ms"
+        ).mean()  # Resample to 20 fps
+        resampled_motion = np.array(resampled_df)
+        return resampled_motion
 
     def rotate_smpl_to(
         self, input_smpl: torch.Tensor, target_quat: List[int]
@@ -211,3 +228,35 @@ class AISTProcess:
             1,
         )
         return motion_combo
+
+    def amass_to_smpl(self, file_path, target_fps, angle=0):
+        raw_amass_motion = np.load(file_path, allow_pickle=True)
+        fps = 0
+        try:
+            if "GRAB" in file_path or "SOMA" in file_path:
+                fps = raw_amass_motion["mocap_frame_rate"]
+            else:
+                fps = raw_amass_motion["mocap_framerate"]
+            frame_number = raw_amass_motion["trans"].shape[0]
+        except:
+            return None
+
+        down_sample = max(int(fps / target_fps), 1)
+        frame_number = raw_amass_motion["trans"].shape[0]
+        pose_seq = []
+        for fId in range(0, frame_number, down_sample):
+            axis_angle_rots = torch.Tensor(
+                raw_amass_motion["poses"][fId : fId + 1, :66]
+            )
+            trans = torch.Tensor(raw_amass_motion["trans"][fId : fId + 1])
+            motion_tensor = torch.cat((trans, axis_angle_rots), 1)
+            pose_seq.append(motion_tensor)
+        amass_smpl = torch.cat(pose_seq, dim=0).detach().cpu()  ## axis angle
+
+        amass_rotated_smpl_6d = self.rotate_smpl_to(amass_smpl.clone(), [1, 0, 0, 0])
+        amass_centered_smpl_6d = self.process_and_center_aist(amass_rotated_smpl_6d)
+        processed_motion = self.get_271_motion_representation(
+            amass_centered_smpl_6d, angle
+        )
+
+        return processed_motion, fps

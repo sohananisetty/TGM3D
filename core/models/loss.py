@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from core.models.smpl.body_model import BodyModel
+import utils.rotation_conversions as geomtry
 
 
 class ReConsLoss(nn.Module):
-    def __init__(self, recons_loss, nb_joints):
+    def __init__(self, recons_loss, nb_joints, motion_dim):
         super(ReConsLoss, self).__init__()
 
         if recons_loss == "l1":
@@ -14,18 +16,20 @@ class ReConsLoss(nn.Module):
         elif recons_loss == "l1_smooth":
             self.Loss = torch.nn.SmoothL1Loss()
 
+        self.bm = BodyModel(
+            "/srv/hays-lab/scratch/sanisetty3/music_motion/motion-diffusion-model/body_models/smplh/neutral/model.npz"
+        )
+
         # 3 global motion associated to root
         # 12 motion (6 rot6d, 3 positions, 3 vel xyz, )
         # 4 foot contact
         self.nb_joints = nb_joints
-        self.motion_dim = nb_joints * 12 + 4 + 3
+        self.motion_dim = motion_dim
 
     def forward(self, motion_pred, motion_gt, mask=None):
         ## pred: b n d, gt: b n d, mask: b n
         if mask is None:
-            loss = self.Loss(
-                motion_pred[..., : self.motion_dim], motion_gt[..., : self.motion_dim]
-            )
+            loss = self.Loss(motion_pred, motion_gt)
         else:
             # F.mse_loss(batch["motion"] * batch["motion_mask"][...,None] , pred_motion*batch["motion"] * batch["motion_mask"][...,None], reduction = "sum")
             norm = motion_pred.numel() / (mask.sum() * motion_pred.shape[-1])
@@ -39,22 +43,66 @@ class ReConsLoss(nn.Module):
 
         return loss
 
+    def forward_new(self, motion_pred, motion_gt, mask=None):
+        bs, n, d = motion_gt.shape  ## d = 135
+        motion_pred_aa = geomtry.matrix_to_axis_angle(
+            geomtry.rotation_6d_to_matrix(motion_pred[:, :, 3:135].reshape(-1, 22, 6))
+        ).reshape(-1, 66)
+        body_pred = self.bm.forward(
+            root_orient=motion_pred_aa[:, :3],
+            pose_body=motion_pred_aa[:, 3:],
+            trans=motion_pred[:, :, :3].reshape(-1, 3),
+            return_dict=True,
+        )
+
+        motion_gt_aa = geomtry.matrix_to_axis_angle(
+            geomtry.rotation_6d_to_matrix(motion_gt[:, :, 3:135].reshape(-1, 22, 6))
+        ).reshape(-1, 66)
+        body_gt = self.bm.forward(
+            root_orient=motion_gt_aa[:, :3],
+            pose_body=motion_gt_aa[:, 3:],
+            trans=motion_gt[:, :, :3].reshape(-1, 3),
+            return_dict=True,
+        )
+
+        j_pred = body_pred["Jtr"].reshape(bs, n, 52, 3)[:, : self.nb_joints, :]
+        j_gt = body_gt["Jtr"].reshape(bs, n, 52, 3)[:, : self.nb_joints, :]
+
+        loss_pos = self.Loss(
+            j_pred,
+            j_gt,
+        )
+        loss_vel = self.Loss(
+            (j_pred[:, 1:] - j_pred[:, :-1]), (j_gt[:, 1:] - j_gt[:, :-1])
+        )
+
+        return loss_pos, loss_vel
+
     def forward_vel(self, motion_pred, motion_gt, mask=None):
+        if motion_pred.shape[-1] == 135 and motion_gt.shape[-1] == 135:
+            loss = self.Loss(
+                (motion_pred[:, 1:, 3:] - motion_pred[:, :-1, 3:]),
+                (motion_gt[:, 1:, 3:] - motion_gt[:, :-1, 3:]),
+            )
+
+            return loss
         if mask is None:
             loss = self.Loss(
-                motion_pred[..., self.nb_joints * 9 : self.nb_joints * 12],
-                motion_gt[..., self.nb_joints * 9 : self.nb_joints * 12],
+                motion_pred[..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)],
+                motion_gt[..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)],
             )
 
         else:
             norm = motion_pred[
-                ..., self.nb_joints * 9 : self.nb_joints * 12
+                ..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)
             ].numel() / (mask.sum() * motion_pred.shape[-1])
             loss = (
                 self.Loss(
-                    motion_pred[..., self.nb_joints * 9 : self.nb_joints * 12]
+                    motion_pred[
+                        ..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)
+                    ]
                     * mask[..., None],
-                    motion_gt[..., self.nb_joints * 9 : self.nb_joints * 12]
+                    motion_gt[..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)]
                     * mask[..., None],
                 )
                 * norm

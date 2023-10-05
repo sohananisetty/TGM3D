@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from core.models.resnet import Resnet1D
-from core.models.seanet import SEANetDecoder, SEANetEncoder
 from core.quantization.vector_quantize import VectorQuantize
 from einops import rearrange
 

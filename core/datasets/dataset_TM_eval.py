@@ -35,7 +35,7 @@ class Text2MotionDataset(data.Dataset):
         self.w_vectorizer = w_vectorizer
         if dataset_name == "t2m":
             self.data_root = (
-                "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanML3D/HumanML3D"
+                "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanMotion/HumanML3D"
             )
             self.motion_dir = pjoin(self.data_root, "new_joint_vecs")
             self.text_dir = pjoin(self.data_root, "texts")
@@ -44,11 +44,19 @@ class Text2MotionDataset(data.Dataset):
             self.max_motion_length = 196
             dim_pose = 263
             self.meta_dir = (
-                "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanML3D/HumanML3D"
+                "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanMotion/HumanML3D"
             )
 
-        mean = np.load(pjoin(self.meta_dir, "Mean.npy"))
-        std = np.load(pjoin(self.meta_dir, "Std.npy"))
+        mean = np.load(
+            pjoin(
+                "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanMotion", "Mean.npy"
+            )
+        )
+        std = np.load(
+            pjoin(
+                "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanMotion", "Std.npy"
+            )
+        )
 
         if is_test:
             split_file = pjoin(self.data_root, "test.txt")

@@ -5,13 +5,13 @@ from functools import partial
 from pathlib import Path
 from random import random
 from typing import Callable, List, Optional, Union
-
+import importlib
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
 from core.models.conv_vqvae import ConvVQMotionModel
-from core.models.muse.attend import Attend, AttentionParams, Attention
-from core.models.muse.positional_embeddings import (
+from core.models.attend import Attend, AttentionParams, Attention
+from core.models.positional_embeddings import (
     PositionalEmbeddingParams,
     PositionalEmbeddingType,
 )
@@ -25,6 +25,42 @@ from core.models.utils import (
 from einops import rearrange, repeat
 from torch import einsum, nn
 from tqdm.auto import tqdm
+
+import os
+
+
+class MotionTokenizer:
+    def __init__(self, config, device):
+        path, class_name = config.model_path.rsplit(".", 1)
+        self.tokenizer = (
+            getattr(
+                importlib.import_module(path),
+                class_name,
+            )
+            .eval()
+            .to(device)
+        )
+        self.chk = os.path.join(config.output_dir, "vqvae_motion.pt")
+
+    def load(self):
+        self.tokenizer.load(self.chk)
+        for param in self.tokenizer.parameters():
+            param.requires_grad = False
+
+    def tokenize(self, motion: torch.Tensor) -> torch.LongTensor:
+        # motion: b n d -> b n/4
+        with torch.no_grad():
+            tokens = self.tokenizer.encode(motion, need_transpose=True)
+
+        return tokens.long()
+
+    def embed(self, indices: torch.LongTensor) -> torch.Tensor:
+        # b n -> b n/4 d'
+
+        with torch.no_grad():
+            quantized, _ = self.tokenizer.decode(indices)
+
+        return quantized
 
 
 class TransformerBlocks(nn.Module):
@@ -61,34 +97,36 @@ class BERTParams:
     attention_params: AttentionParams = AttentionParams()
     positional_embedding_params: PositionalEmbeddingParams = PositionalEmbeddingParams()
     positional_embedding: PositionalEmbeddingType = PositionalEmbeddingType.SINE
-    num_tokens: int = 1024
-    dim_out: int = 768
-    depth: int = 12
+    codebook_size: int = 1024
+    dim_out: Optional[int] = 768
+    depth: int = 8
     ff_mult: int = 4
-    emb_dropout = 0.1
-    post_emb_norm = False
+    emb_dropout = 0.3
+    post_emb_norm = True
 
 
 class BERT(nn.Module):
     def __init__(self, transformer_params: BERTParams):
         super().__init__()
         self.dim = transformer_params.attention_params.dim
-        self.num_tokens = transformer_params.num_tokens
+        self.dim_out = transformer_params.dim_out
+        self.codebook_size = transformer_params.codebook_size
         self.seq_len = transformer_params.positional_embedding_params.max_seq_len
-
-        self.mask_id = self.num_tokens
-        self.bos_index = self.num_tokens + 1
-        self.eos_index = self.num_tokens + 2
+        self.mask_index = self.codebook_size
+        self.pad_index = self.codebook_size + 1
+        self.vocab_size = self.codebook_size + 3
+        # self.token_emb = nn.Embedding(
+        #     self.vocab_size, self.dim, padding_idx=self.pad_index
+        # )
+        # self.spec_token_emb = nn.Embedding(3, self.dim, padding_idx=self.pad_index)
+        # self.motion_emb = torch.nn.Embedding.from_pretrained(codebook)
         self.token_emb = nn.Embedding(
-            self.num_tokens + 3, self.dim, padding_idx=self.mask_id
+            self.vocab_size, self.dim, padding_idx=self.pad_index
         )
 
-        self.segment_emb = nn.Embedding(3, self.dim, padding_idx=0)
+        # self.segment_emb = nn.Embedding(3, self.dim, padding_idx=0)
 
-        self.is_abs_pos_emb = transformer_params.positional_embedding.name in [
-            "ABS",
-            "SINE",
-        ]
+        self.is_abs_pos_emb = True
 
         self.pos_emb = transformer_params.positional_embedding.value(
             transformer_params.positional_embedding_params
@@ -103,8 +141,11 @@ class BERT(nn.Module):
         )
         self.norm = LayerNorm(self.dim)
 
-        self.dim_out = default(transformer_params.dim_out, self.num_tokens)
-        self.to_logits = nn.Linear(self.dim, self.dim_out, bias=False)
+        # self.dim_out = default(transformer_params.dim_out, self.vocab_size)
+        self.to_logits = nn.Linear(self.dim, self.vocab_size, bias=False)
+        self.to_out = nn.Linear(self.dim, self.dim_out, bias=False)
+
+        # self.softmax = nn.LogSoftmax(dim=-1)
 
         self.post_emb_norm = (
             nn.LayerNorm(self.dim)
@@ -112,34 +153,51 @@ class BERT(nn.Module):
             else nn.Identity()
         )
 
+    # def next_sentence(self, x):
+    #     return self.softmax(self.nsp_linear(x[:, 0]))
+
+    # def mask_lm(self, x):
+    #     return self.softmax(self.mlm_linear(x))
+
+    def embed(self, x):
+        mask = x > self.motion_emb.num_embeddings
+
+        # You may want to optimize it, you could probably get away without copy, though
+        # I'm not currently sure how
+        pretrained_batch = x.copy()
+        pretrained_batch[mask] = 0
+
+        embedded_batch = self.motion_emb(pretrained_batch)
+
+        # Every token without representation has to be brought into appropriate range
+        x -= self.motion_emb.num_embeddings
+        # Zero out the ones which already have pretrained embedding
+        x[~mask] = 0
+        non_pretrained_embedded_batch = self.spec_token_emb(x)
+
+        # And finally change appropriate tokens from placeholder embedding created by
+        # pretrained into trainable embeddings.
+        embedded_batch[mask] = non_pretrained_embedded_batch[mask]
+
+        return embedded_batch
+
     def forward(
         self,
         x: torch.Tensor,
-        segment_label: torch.Tensor = None,
         mask: torch.Tensor = None,
         return_embed: bool = False,
-        return_logits: bool = False,
-        labels=None,
-        ignore_index: int = -1,
         pos: torch.Tensor = None,
     ):
         device, b, n = x.device, *x.shape
         assert n <= self.seq_len
 
         if mask is None:
-            mask = x != self.mask_id
+            mask = x != self.mask_index
 
         # embed tokens
-        if self.is_abs_pos_emb:
-            x = (
-                self.token_emb(x)
-                + self.pos_emb(x, pos=pos)
-                + self.segment_emb(segment_label)
-            )
-            rel_pos = None
-        else:
-            x = self.token_emb(x) + self.segment_emb(segment_label)
-            rel_pos = self.pos_emb
+
+        x = self.token_emb(x) + self.pos_emb(x, pos=pos)
+        # + self.segment_emb(segment_label)
 
         # post embedding norm, purportedly leads to greater stabilization
         x = self.post_emb_norm(x)
@@ -147,85 +205,13 @@ class BERT(nn.Module):
         embed = self.transformer_blocks(
             x,
             mask=mask,
-            rel_pos=rel_pos,
         )
 
-        logits = self.to_logits(embed)
+        logits = self.to_logits(embed[:, 1:])
+        out = self.to_out(embed[:, 0])
+        # mlm = self.mask_lm(logits)
 
         if return_embed:
-            return logits, embed
+            return logits, out, embed
 
-        if not exists(labels):
-            return logits
-
-        if self.dim_out == 1:
-            loss = F.binary_cross_entropy_with_logits(
-                rearrange(logits, "... 1 -> ..."), labels
-            )
-        else:
-            loss = F.cross_entropy(
-                rearrange(logits, "b n c -> b c n"), labels, ignore_index=ignore_index
-            )
-
-        if not return_logits:
-            return loss
-
-        return loss, logits
-
-
-class BERTLM(nn.Module):
-    """
-    BERT Language Model
-    Next Sentence Prediction Model + Masked Language Model
-    """
-
-    def __init__(self, bert: BERT, vocab_size):
-        """
-        :param bert: BERT model which should be trained
-        :param vocab_size: total vocab size for masked_lm
-        """
-
-        super().__init__()
-        self.bert = bert
-        self.next_sentence = NextSentencePrediction(self.bert.dim)
-        self.mask_lm = MaskedLanguageModel(self.bert.dim, vocab_size)
-
-    def forward(self, x, segment_label):
-        x = self.bert(x, segment_label=segment_label)
-        return self.next_sentence(x), self.mask_lm(x)
-
-
-class NextSentencePrediction(nn.Module):
-    """
-    2-class classification model : is_next, is_not_next
-    """
-
-    def __init__(self, hidden):
-        """
-        :param hidden: BERT model output size
-        """
-        super().__init__()
-        self.linear = nn.Linear(hidden, 2)
-        self.softmax = nn.LogSoftmax(dim=-1)
-
-    def forward(self, x):
-        return self.softmax(self.linear(x[:, 0]))
-
-
-class MaskedLanguageModel(nn.Module):
-    """
-    predicting origin token from masked input sequence
-    n-class classification problem, n-class = vocab_size
-    """
-
-    def __init__(self, hidden, vocab_size):
-        """
-        :param hidden: output size of BERT model
-        :param vocab_size: total vocab size
-        """
-        super().__init__()
-        self.linear = nn.Linear(hidden, vocab_size)
-        self.softmax = nn.LogSoftmax(dim=-1)
-
-    def forward(self, x):
-        return self.softmax(self.linear(x))
+        return logits, out

@@ -97,8 +97,8 @@ def plot_3d_motion(args, figsize=(10, 10), fps=120, radius=4):
 
         init()
 
-        # ax.lines = []
-        # ax.collections = []
+        ax.lines = []
+        ax.collections = []
         ax.view_init(elev=110, azim=-90)
         ax.dist = 7.5
         plot_xzPlane(

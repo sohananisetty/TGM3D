@@ -80,18 +80,23 @@ class VQMotionDataset(data.Dataset):
         self.joints_num = 22
         self.enable_var_len = enable_var_len
 
+        if "SMPL" in data_root:
+            a = "_SMPL"
+        else:
+            a = ""
+
         if dataset_name == "t2m":
-            self.data_root = os.path.join(data_root, "HumanML3D_SMPL")
+            self.data_root = os.path.join(data_root, "HumanML3D" + a)
             self.motion_dir = os.path.join(self.data_root, "new_joint_vecs")
             self.text_dir = os.path.join(self.data_root, "texts")
 
         if dataset_name == "aist":
-            self.data_root = os.path.join(data_root, "AIST_SMPL/")
+            self.data_root = os.path.join(data_root, "AIST" + a)
             self.motion_dir = os.path.join(self.data_root, "new_joint_vecs")
             self.music_dir = os.path.join(self.data_root, "music")
 
         if dataset_name == "cm":
-            self.data_root = os.path.join(data_root, "Choreomaster_SMPL/")
+            self.data_root = os.path.join(data_root, "Choreomaster" + a)
             self.motion_dir = os.path.join(self.data_root, "new_joint_vecs")
             self.music_dir = os.path.join(self.data_root, "music")
 
@@ -122,9 +127,10 @@ class VQMotionDataset(data.Dataset):
         print("Total number of motions {}".format(len(self.data)))
 
     def inv_transform(self, data: torch.Tensor) -> torch.Tensor:
-        return data * (torch.Tensor(self.std).to(data.device) - 1e-8) + torch.Tensor(
-            self.mean
-        ).to(data.device)
+        print(data.shape, self.std[: data.shape[-1]].shape)
+        return data * (
+            torch.Tensor(self.std[: data.shape[-1]]).to(data.device) - 1e-8
+        ) + torch.Tensor(self.mean[: data.shape[-1]]).to(data.device)
 
     def __len__(self) -> int:
         return len(self.data)
