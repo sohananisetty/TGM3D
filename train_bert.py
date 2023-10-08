@@ -1,5 +1,5 @@
 from configs.config import cfg, get_cfg_defaults
-from ctl.trainer_bert2 import BERTTrainer
+from ctl.trainer_bert import BERTTrainer
 
 
 def main(cfg):

@@ -29,7 +29,9 @@ class ReConsLoss(nn.Module):
     def forward(self, motion_pred, motion_gt, mask=None):
         ## pred: b n d, gt: b n d, mask: b n
         if mask is None:
-            loss = self.Loss(motion_pred, motion_gt)
+            loss = self.Loss(
+                motion_pred[..., : self.motion_dim], motion_gt[..., : self.motion_dim]
+            )
         else:
             # F.mse_loss(batch["motion"] * batch["motion_mask"][...,None] , pred_motion*batch["motion"] * batch["motion_mask"][...,None], reduction = "sum")
             norm = motion_pred.numel() / (mask.sum() * motion_pred.shape[-1])
@@ -99,10 +101,10 @@ class ReConsLoss(nn.Module):
             loss = (
                 self.Loss(
                     motion_pred[
-                        ..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)
+                        ..., (3 + self.nb_joints * 6) : (3 + self.nb_joints * 9)
                     ]
                     * mask[..., None],
-                    motion_gt[..., (3 + self.nb_joints * 9) : (3 + self.nb_joints * 12)]
+                    motion_gt[..., (3 + self.nb_joints * 6) : (3 + self.nb_joints * 9)]
                     * mask[..., None],
                 )
                 * norm

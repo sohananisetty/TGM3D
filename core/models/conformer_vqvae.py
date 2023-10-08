@@ -156,7 +156,7 @@ class Decoder(nn.Module):
 class ConformerVQMotionModel(nn.Module):
     """Audio Motion VQGAN model."""
 
-    def __init__(self, args, device="cuda"):
+    def __init__(self, args):
         """Initializer for VQGANModel.
 
         Args:
@@ -166,7 +166,6 @@ class ConformerVQMotionModel(nn.Module):
         """
         super(ConformerVQMotionModel, self).__init__()
 
-        self.device = device
         self.dim = args.enc_dec_dim
 
         self.motionEncoder = Encoder(

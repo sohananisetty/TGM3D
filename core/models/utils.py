@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import nn
+import importlib
+from core.datasets.motion_bert_dataset import TokenizerParams
 
 
 def exists(val):
@@ -111,6 +113,18 @@ def get_mask_subset_prob(mask, prob, min_mask=0):
     return subset_mask
 
 
+def prob_mask_like(shape, prob, device=None):
+    def uniform(shape, min=0, max=1, device=None):
+        return torch.zeros(shape, device=device).float().uniform_(0, 1)
+
+    if prob == 1:
+        return torch.ones(shape, device=device, dtype=torch.bool)
+    elif prob == 0:
+        return torch.zeros(shape, device=device, dtype=torch.bool)
+    else:
+        return uniform(shape, device=device) < prob
+
+
 class LayerNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -175,3 +189,64 @@ class AdaIn(nn.Module):
         x = self.norm(x)
         x = x * style_std + style_mean
         return x
+
+
+def get_obj_from_str(string, reload=False):
+    """
+    Get object from string
+    """
+
+    module, cls = string.rsplit(".", 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
+
+
+def instantiate_from_config(config):
+    """
+    Instantiate object from config
+    """
+    if not "target" in config:
+        raise KeyError("Expected key `target` to instantiate.")
+    return get_obj_from_str(config["target"])(config)
+
+
+def mask_for_mlm(
+    input_ids,
+    tokenizer_params=TokenizerParams,
+    targets=None,
+    masked_indices=None,
+    probability_matrix=None,
+):
+    if masked_indices is None:
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+
+    masked_indices[input_ids == tokenizer_params.pad_index] = False
+    masked_indices[input_ids == tokenizer_params.cls_index] = False
+
+    if targets is not None:
+        targets[~masked_indices] = -100  # We only compute loss on masked tokens
+
+    # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
+    indices_replaced = (
+        torch.bernoulli(torch.full(input_ids.shape, 0.8)).bool() & masked_indices
+    )
+    input_ids[indices_replaced] = tokenizer_params.mask_index
+
+    # 10% of the time, we replace masked input tokens with random word
+    indices_random = (
+        torch.bernoulli(torch.full(input_ids.shape, 0.5)).bool()
+        & masked_indices
+        & ~indices_replaced
+    )
+    random_words = torch.randint(
+        tokenizer_params.vocab_size, input_ids.shape, dtype=torch.long
+    ).to(input_ids.device)
+    input_ids[indices_random] = random_words[indices_random]
+    # The rest of the time (10% of the time) we keep the masked input tokens unchanged
+
+    if targets is not None:
+        return input_ids, targets
+    else:
+        return input_ids

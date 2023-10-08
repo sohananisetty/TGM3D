@@ -7,7 +7,9 @@ import os
 from glob import glob
 
 from utils.word_vectorizer import POS_enumerator
+from core.models.text_encoders import Clip, T5
 from yacs.config import CfgNode as CN
+
 
 cfg = CN()
 
@@ -16,7 +18,6 @@ cfg.abs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 cfg.device = "cuda"
 
 cfg.vqvae_model_name = "vqvae"
-cfg.model_path = "core.models"
 
 cfg.motion_trans_model_name = "trans"
 cfg.extractors_model_name = "aist_extractor_GRU"
@@ -72,6 +73,7 @@ cfg.train.lr_scheduler_type = "cosine"
 cfg.train.use_mixture = False
 
 cfg.vqvae = CN()
+cfg.vqvae.target = "core.models"
 
 cfg.vqvae.nb_joints = 22
 cfg.vqvae.motion_dim = 271  #'Input motion dimension dimension'
@@ -94,7 +96,6 @@ cfg.vqvae.min_length_seconds = 3
 ##conv
 cfg.vqvae.down_sampling_ratio = 4
 cfg.vqvae.width = 512
-cfg.vqvae.resnet_depth = 3
 
 
 cfg.motion_trans = CN()
@@ -146,17 +147,22 @@ cfg.eval_model.dim_movement_latent = 512
 
 
 cfg.bert = CN()
-cfg.bert.dim = 768
-cfg.bert.heads = 8
-cfg.bert.depth = 12
-cfg.bert.num_tokens = 1024
-cfg.bert.window_size = 80
-cfg.bert.loss_nsp = 1.0
-cfg.bert.loss_mlm = 1.0
-cfg.bert.causal = False
-cfg.bert.codebook_size = 1024
-cfg.bert.mask_prob = 0.15
-cfg.bert.max_motion_length = 128
+cfg.bert.bert_config = "bert_config.json"
+cfg.bert.mlm_probability = 0.15
+cfg.bert.vqvae = "core.models.conformer_vqvae.ConformerVQMotionModel"
+cfg.bert.vqvae_path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/checkpoints/conformer_512_1024_affine/vqvae_motion.pt"
+cfg.bert.text_encoder = T5
+# cfg.bert.dim = 768
+# cfg.bert.heads = 8
+# cfg.bert.depth = 12
+# cfg.bert.num_tokens = 1024
+# cfg.bert.window_size = 80
+# cfg.bert.loss_nsp = 1.0
+# cfg.bert.loss_mlm = 1.0
+# cfg.bert.causal = False
+# cfg.bert.codebook_size = 1024
+# cfg.bert.mask_prob = 0.15
+# cfg.bert.max_motion_length = 128
 
 
 def get_cfg_defaults():

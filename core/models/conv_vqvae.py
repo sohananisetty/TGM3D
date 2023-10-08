@@ -105,7 +105,7 @@ class Decoder(nn.Module):
 class ConvVQMotionModel(nn.Module):
     """Audio Motion VQGAN model."""
 
-    def __init__(self, args, is_distributed=False, device="cuda"):
+    def __init__(self, args, is_distributed=False):
         """Initializer for VQGANModel.
 
         Args:
@@ -115,7 +115,6 @@ class ConvVQMotionModel(nn.Module):
         """
         super(ConvVQMotionModel, self).__init__()
 
-        self.device = device
         self.dim = args.motion_dim
 
         self.motionEncoder = Encoder(
@@ -123,7 +122,7 @@ class ConvVQMotionModel(nn.Module):
             output_emb_width=args.enc_dec_dim,
             width=args.width,
             down_sampling_ratio=args.down_sampling_ratio,
-            depth=args.resnet_depth,
+            depth=args.depth,
         )
 
         self.motionDecoder = Decoder(
@@ -131,22 +130,8 @@ class ConvVQMotionModel(nn.Module):
             output_emb_width=args.enc_dec_dim,
             width=args.width,
             down_sampling_ratio=args.down_sampling_ratio,
-            depth=args.resnet_depth,
+            depth=args.depth,
         )
-
-        # self.motionEncoder = SEANetEncoder(
-        #     channels=args.motion_dim,
-        #     dimension=args.enc_dec_dim,
-        #     ratios=[2, 2],
-        #     causal=True,
-        # )
-
-        # self.motionDecoder = SEANetDecoder(
-        #     channels=args.motion_dim,
-        #     dimension=args.enc_dec_dim,
-        #     ratios=[2, 2],
-        #     causal=True,
-        # )
 
         self.vq = VectorQuantize(
             dim=args.enc_dec_dim,
@@ -163,7 +148,7 @@ class ConvVQMotionModel(nn.Module):
         )
 
     def forward(
-        self, motion: torch.Tensor
+        self, motion: torch.Tensor, mask=None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Predict sequences from inputs.
 

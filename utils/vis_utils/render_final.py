@@ -13,6 +13,7 @@ from core.models.smpl.smpl import SMPL
 from pyrender.constants import RenderFlags
 from shapely import geometry
 from utils import rotation_conversions
+from typing import Optional
 
 
 class WeakPerspectiveCamera(pyrender.Camera):
@@ -76,7 +77,7 @@ class Renderer:
         self,
         motion_vec: torch.Tensor,
         name: str,
-        step: int = 0,
+        step: Optional[int] = None,
         outdir: str = "test_vis",
     ):
         smpl_dict = self.process6D(motion_vec[:, :135].to(self.device))
@@ -171,6 +172,10 @@ class Renderer:
             r.delete()
 
         out = np.stack(vid, axis=0)
-        imageio.mimsave(
-            os.path.join(outdir, str(step), str(name) + ".gif"), out, duration=50
+
+        out_path = (
+            os.path.join(outdir, str(step), str(name) + ".gif")
+            if step is not None
+            else os.path.join(outdir, str(name) + ".gif")
         )
+        imageio.mimsave(out_path, out, duration=50)

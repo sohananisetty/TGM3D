@@ -26,3 +26,6 @@ if __name__ == "__main__":
 
 
 # accelerate configuration saved at /nethome/sanisetty3/.cache/huggingface/accelerate/default_config.yaml
+
+# conformer_512_1024_affine
+# convq_256_1024_affine

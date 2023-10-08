@@ -18,7 +18,12 @@ from tqdm import tqdm
 from collections import Counter
 from core.datasets.dataset_loading_utils import load_dataset_bert
 from core.datasets.motion_bert_dataset import DATALoader
-from core.models.BERT import BERT, BERTParams
+from music_motion.TGM3D.core.models.motion_bert import MotionBERT
+from core.models.albef.xbert import BertForMaskedLM
+from transformers.models.bert.configuration_bert import BertConfig
+from core.datasets.motion_bert_dataset import TokenizerParams, MotionCollator
+from core.models.utils import mask_for_mlm
+from core.models.text_encoders import Clip, T5, TextEncoderParams
 
 
 def exists(val):
@@ -87,43 +92,28 @@ class BERTTrainer(nn.Module):
         self.dataset_name = args.dataset.dataset_name
         self.model_name = args.bert_model_name
         self.num_train_steps = self.training_args.num_train_iters
-        self.num_stages = self.training_args.num_stages
         self.output_dir = Path(self.args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.register_buffer("steps", torch.Tensor([0]))
-        params = BERTParams(
-            dim_out=self.bert_args.dim,
-            depth=self.bert_args.depth,
-            codebook_size=self.bert_args.codebook_size,
-        )
-        params.attention_params.dim = self.bert_args.dim
-        params.attention_params.heads = self.bert_args.heads
-        params.attention_params.causal = self.bert_args.causal
-        params.positional_embedding_params.max_seq_len = (
-            self.bert_args.max_motion_length
-        )
-        self.bert_model = BERT(params)
 
-        codebook = torch.load(
-            "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/checkpoints/conformer_768_1024_hmlvec/codebook.pt",
-            map_location="cuda",
+        self.bert_model = MotionBERT(self.args)
+        self.text_encoder = self.bert_args.text_encoder(device=self.device)
+
+        self.tokenizer_prams = TokenizerParams(
+            pad_index=self.bert_model.bert_config.pad_token_id,
+            vocab_size=self.bert_model.bert_config.vocab_size,
+            model_max_length=self.bert_model.bert_config.max_position_embeddings,
         )
-        self.bert_model.token_emb.weight.data[: codebook.shape[0]] = codebook
 
-        self.print("init codebook weights")
-        self.pad_index = self.bert_model.pad_index
-
-        print(params)
+        self.pad_index = self.tokenizer_prams.pad_index
 
         total = sum(p.numel() for p in self.bert_model.parameters() if p.requires_grad)
         print("Total training params: %.2fM" % (total / 1e6))
 
         self.grad_accum_every = self.training_args.gradient_accumulation_steps
 
-        self.mlm_loss_fnc = torch.nn.CrossEntropyLoss(
-            ignore_index=self.bert_model.pad_index
-        )
+        self.mlm_loss_fnc = torch.nn.CrossEntropyLoss()
 
         self.optim = get_optimizer(
             self.bert_model.parameters(),
@@ -145,7 +135,7 @@ class BERTTrainer(nn.Module):
                 dataset_names=["t2m", "aist", "cm"],
                 args=self.args,
                 split="train",
-                weight_scale=[1, 1, 1],
+                weight_scale=[2, 1, 1],
             )
             test_ds, _, _ = load_dataset_bert(
                 dataset_names=["t2m", "aist", "cm"], args=self.args, split="test"
@@ -168,28 +158,38 @@ class BERTTrainer(nn.Module):
                 f"training with training {len(train_ds)} and test dataset of  and  {len(test_ds)} samples"
             )
 
-        self.dl = DATALoader(
+        collate_fn = MotionCollator(self.text_encoder)
+
+        self.dl = torch.utils.data.DataLoader(
             train_ds,
             batch_size=self.training_args.train_bs,
             sampler=sampler_train,
             shuffle=False if sampler_train else True,
+            collate_fn=collate_fn,
         )
-        self.valid_dl = DATALoader(
+        self.valid_dl = torch.utils.data.DataLoader(
             test_ds,
             batch_size=self.training_args.eval_bs,
             shuffle=False,
+            collate_fn=collate_fn,
         )
 
         # prepare with accelerator
 
         (
             self.bert_model,
+            self.text_encoder,
             self.optim,
             self.dl,
             self.valid_dl,
             self.lr_scheduler,
         ) = self.accelerator.prepare(
-            self.bert_model, self.optim, self.dl, self.valid_dl, self.lr_scheduler
+            self.bert_model,
+            self.text_encoder,
+            self.optim,
+            self.dl,
+            self.valid_dl,
+            self.lr_scheduler,
         )
 
         self.dl_iter = cycle(self.dl)
@@ -204,7 +204,6 @@ class BERTTrainer(nn.Module):
         self.best_fid = float("inf")
 
         hps = {
-            "window size": self.bert_args.window_size,
             "learning_rate": self.training_args.learning_rate,
         }
         self.accelerator.init_trackers(f"{self.model_name}", config=hps)
@@ -266,26 +265,32 @@ class BERTTrainer(nn.Module):
 
         self.bert_model.train()
 
-        # logs
-
         logs = {}
 
         for _ in range(self.grad_accum_every - 1):
             data = next(self.dl_iter)
 
             with self.accelerator.no_sync(self.bert_model):
-                mask_lm_output = self.bert_model.forward(
-                    data["bert_input"], data["mask"]
-                )
-                # print(data["bert_label"].min(), data["bert_label"].max())
-                # print(data["bert_label"].min() , data["bert_label"].max())
+                input_ids = data["input_ids"]
+                labels = input_ids.clone()
 
-                mask_loss = self.mlm_loss_fnc(
-                    mask_lm_output.transpose(1, 2), data["bert_label"]
+                mask_lm_output = self.bert_model(
+                    input_ids=input_ids,
+                    attention_mask=data["attention_mask"],
+                    labels=labels,
+                    context=data["context"],
+                    context_mask=data["context_mask"],
+                    cond_drop_prob=1,
                 )
-                msk = data["bert_label"] != self.pad_index
+
+                mask_loss = mask_lm_output.loss
+
                 loss = self.bert_args.loss_mlm * mask_loss
-                correct = mask_lm_output.argmax(-1)[msk] == data["bert_label"][msk]
+                correct = (
+                    mask_lm_output.logits.argmax(-1)[labels != -100]
+                    == labels[labels != -100]
+                )
+
                 correct = correct.sum() / len(correct)
 
                 self.accelerator.backward(loss)
@@ -293,7 +298,6 @@ class BERTTrainer(nn.Module):
                 accum_log(
                     logs,
                     dict(
-                        loss=loss.detach().cpu() / self.grad_accum_every,
                         mask_loss=mask_loss.detach().cpu() / self.grad_accum_every,
                         correct=correct.cpu() / self.grad_accum_every,
                     ),
@@ -301,15 +305,25 @@ class BERTTrainer(nn.Module):
 
         data = next(self.dl_iter)
 
-        mask_lm_output = self.bert_model.forward(data["bert_input"], data["mask"])
+        input_ids = data["input_ids"]
+        labels = input_ids.clone()
 
-        mask_loss = self.mlm_loss_fnc(
-            mask_lm_output.transpose(1, 2), data["bert_label"]
+        mask_lm_output = self.bert_model(
+            input_ids=input_ids,
+            attention_mask=data["attention_mask"],
+            labels=labels,
+            context=data["context"],
+            context_mask=data["context_mask"],
+            cond_drop_prob=1,
         )
 
-        msk = data["bert_label"] != self.pad_index
+        mask_loss = mask_lm_output.loss
+
         loss = self.bert_args.loss_mlm * mask_loss
-        correct = mask_lm_output.argmax(-1)[msk] == data["bert_label"][msk]
+        correct = (
+            mask_lm_output.logits.argmax(-1)[labels != -100] == labels[labels != -100]
+        )
+
         correct = correct.sum() / len(correct)
 
         self.accelerator.backward(loss)
@@ -317,7 +331,6 @@ class BERTTrainer(nn.Module):
         accum_log(
             logs,
             dict(
-                loss=loss.detach().cpu() / self.grad_accum_every,
                 mask_loss=mask_loss.detach().cpu() / self.grad_accum_every,
                 correct=correct.cpu() / self.grad_accum_every,
             ),
@@ -328,11 +341,10 @@ class BERTTrainer(nn.Module):
         self.optim.zero_grad()
 
         if log_losses:
-            losses_str = f"{steps}: bert model loss: {logs['loss'].float():.3} mlm loss: {logs['mask_loss'].float():.3} correct: {correct.float():.3} "
+            losses_str = f"{steps}: bert model loss:  mlm loss: {logs['mask_loss'].float():.3} correct: {correct.float():.3} "
             self.print(losses_str)
             self.accelerator.log(
                 {
-                    "total_loss": logs["loss"],
                     "mask_loss": logs["mask_loss"],
                 },
                 step=steps,
@@ -375,21 +387,27 @@ class BERTTrainer(nn.Module):
 
         with torch.no_grad():
             for data in tqdm((self.valid_dl), position=0, leave=True):
-                mask_lm_output = self.bert_model.forward(
-                    data["bert_input"], data["mask"]
+                input_ids = data["input_ids"]
+                labels = input_ids.clone()
+
+                mask_lm_output = self.bert_model(
+                    input_ids=input_ids,
+                    attention_mask=data["attention_mask"],
+                    labels=labels,
+                    context=data["context"],
+                    context_mask=data["context_mask"],
+                    cond_drop_prob=1,
+                )
+                mask_loss = mask_lm_output.loss
+
+                correct = (
+                    mask_lm_output.logits.argmax(-1)[labels != -100]
+                    == labels[labels != -100]
                 )
 
-                mask_loss = self.mlm_loss_fnc(
-                    mask_lm_output.transpose(1, 2), data["bert_label"]
-                )
-
-                msk = data["bert_label"] != self.pad_index
-                loss = self.bert_args.loss_mlm * mask_loss
-                correct = mask_lm_output.argmax(-1)[msk] == data["bert_label"][msk]
                 correct = correct.sum() / len(correct)
 
                 loss_dict = {
-                    "total_loss": loss.detach().cpu(),
                     "mask_loss": mask_loss.detach().cpu(),
                     "correct": correct.cpu(),
                 }

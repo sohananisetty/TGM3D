@@ -4,7 +4,11 @@ from enum import Enum
 import torch
 
 from .vq_dataset import VQMotionDataset
-from .motion_bert_dataset import BERTMotionDataset
+from .motion_bert_dataset import (
+    BERTMotionDataset,
+    TokenizerParams,
+    BERTPretrainMotionDataset,
+)
 
 
 class AIST_GENRE(Enum):
@@ -68,6 +72,7 @@ def load_dataset_bert(
     dataset_names: List[str],
     args: Dict = None,
     split: str = "train",
+    tokenization_params=TokenizerParams,
     weight_scale: Optional[List[int]] = None,
 ):
     if weight_scale is None:
@@ -77,12 +82,10 @@ def load_dataset_bert(
     weights = []
     for dataset_name in dataset_names:
         dataset_list.append(
-            BERTMotionDataset(
+            BERTPretrainMotionDataset(
                 dataset_name,
                 data_root=args.dataset.dataset_root,
-                window_size=args.bert.window_size,
-                mask_prob=args.bert.mask_prob,
-                max_motion_length=args.bert.max_motion_length,
+                tokenization_params=tokenization_params,
                 split=split,
             )
         )

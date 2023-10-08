@@ -33,7 +33,7 @@ from transformers import AdamW, get_scheduler
 # from utils.eval_trans import evaluation_vqvae, evaluation_vqvae_loss
 from utils.vis_utils.render_final import Renderer
 import utils.vis_utils.plot_3d_global as plot_3d
-
+from core.models.utils import instantiate_from_config
 from yacs.config import CfgNode
 
 # from utils.word_vectorizer import WordVectorizer
@@ -108,9 +108,9 @@ class VQVAEMotionTrainer(nn.Module):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.register_buffer("steps", torch.Tensor([0]))
         print(self.vqvae_args)
-        self.vqvae_model = ConformerVQMotionModel(
-            self.vqvae_args,
-        ).to(self.device)
+
+        self.vqvae_model = instantiate_from_config(self.vqvae_args).to(self.device)
+
         total = sum(p.numel() for p in self.vqvae_model.parameters() if p.requires_grad)
         print("Total training params: %.2fM" % (total / 1e6))
 
@@ -151,16 +151,20 @@ class VQVAEMotionTrainer(nn.Module):
 
         if self.dataset_args.dataset_name == "mix":
             train_ds, sampler_train, weights_train = load_dataset(
-                dataset_names=["t2m", "aist", "cm"],
+                dataset_names=["t2m", "aist", "cm", "moyo"],
                 args=self.args,
                 split="train",
-                weight_scale=[1.5, 1, 1],
+                weight_scale=[2.0, 1, 1, 0.2],
             )
             test_ds, _, _ = load_dataset(
-                dataset_names=["t2m", "aist", "cm"], args=self.args, split="test"
+                dataset_names=["t2m", "aist", "cm", "moyo"],
+                args=self.args,
+                split="test",
             )
             self.render_ds, _, _ = load_dataset(
-                dataset_names=["t2m", "aist", "cm"], args=self.args, split="render"
+                dataset_names=["t2m", "aist", "cm", "moyo"],
+                args=self.args,
+                split="render",
             )
 
             # if self.is_main:
@@ -244,23 +248,6 @@ class VQVAEMotionTrainer(nn.Module):
     @property
     def device(self):
         return torch.device("cuda")
-
-    # self.accelerator.device
-
-    @property
-    def is_distributed(self):
-        return not (
-            self.accelerator.distributed_type == DistributedType.NO
-            and self.accelerator.num_processes == 1
-        )
-
-    @property
-    def is_main(self):
-        return self.accelerator.is_main_process
-
-    @property
-    def is_local_main(self):
-        return self.accelerator.is_local_main_process
 
     def save(self, path, loss=None):
         pkg = dict(
@@ -373,6 +360,7 @@ class VQVAEMotionTrainer(nn.Module):
                 self.output_dir, "checkpoints", f"vqvae_motion.{steps}.pt"
             )
             self.save(model_path)
+            print(float(logs["loss"]), self.best_loss)
 
             if float(logs["loss"]) <= self.best_loss:
                 model_path = os.path.join(self.output_dir, f"vqvae_motion.pt")

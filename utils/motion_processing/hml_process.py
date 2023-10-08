@@ -14,6 +14,8 @@ from utils.motion_processing.quaternion import (
     quaternion_to_cont6d_np,
 )
 from .skeleton import Skeleton, t2m_kinematic_chain, t2m_raw_offsets
+from human_body_prior.body_model.body_model import BodyModel
+import utils.rotation_conversions as geometry
 
 l_idx1, l_idx2 = 5, 8
 # Right/Left foot
@@ -28,16 +30,15 @@ kinematic_chain = t2m_kinematic_chain
 
 
 def get_target_offset():
-    example_data = np.load("./target.npy")
+    example_data = np.load(
+        "/srv/hays-lab/scratch/sanisetty3/music_motion/HumanML3D/joints/000021.npy"
+    )
     example_data = example_data.reshape(len(example_data), -1, 3)
     example_data = torch.from_numpy(example_data)
     tgt_skel = Skeleton(n_raw_offsets, kinematic_chain, "cpu")
     # (joints_num, 3)
     tgt_offsets = tgt_skel.get_offsets_joints(example_data[0])
     return tgt_offsets
-
-
-# def cont6d_to_axis_angle(motion):
 
 
 def uniform_skeleton(
@@ -299,3 +300,96 @@ def recover_from_ric(data, joints_num):
     positions = torch.cat([r_pos.unsqueeze(-2), positions], dim=-2)
 
     return positions
+
+
+class HMLProcess:
+    def __init__(self, device="cuda"):
+        self.device = device
+        male_bm_path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/body_models/smplh/male/model.npz"
+        male_dmpl_path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/body_models/dmpls/male/model.npz"
+
+        female_bm_path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/body_models/smplh/female/model.npz"
+        female_dmpl_path = "/srv/hays-lab/scratch/sanisetty3/music_motion/TGM3D/body_models/dmpls/female/model.npz"
+
+        num_betas = 10  # number of body parameters
+        num_dmpls = 8  # number of DMPL parameters
+
+        self.male_bm = BodyModel(
+            bm_fname=male_bm_path,
+            num_betas=num_betas,
+            num_dmpls=num_dmpls,
+            dmpl_fname=male_dmpl_path,
+        ).to(device)
+        self.faces = (self.male_bm.f).cpu()
+
+        self.female_bm = BodyModel(
+            bm_fname=female_bm_path,
+            num_betas=num_betas,
+            num_dmpls=num_dmpls,
+            dmpl_fname=female_dmpl_path,
+        ).to(device)
+
+    def swap_left_right(self, data):
+        assert len(data.shape) == 3 and data.shape[-1] == 3
+        data = data.copy()
+        data[..., 0] *= -1
+        right_chain = [2, 5, 8, 11, 14, 17, 19, 21]
+        left_chain = [1, 4, 7, 10, 13, 16, 18, 20]
+        left_hand_chain = [22, 23, 24, 34, 35, 36, 25, 26, 27, 31, 32, 33, 28, 29, 30]
+        right_hand_chain = [43, 44, 45, 46, 47, 48, 40, 41, 42, 37, 38, 39, 49, 50, 51]
+        tmp = data[:, right_chain]
+        data[:, right_chain] = data[:, left_chain]
+        data[:, left_chain] = tmp
+        if data.shape[1] > 24:
+            tmp = data[:, right_hand_chain]
+            data[:, right_hand_chain] = data[:, left_hand_chain]
+            data[:, left_hand_chain] = tmp
+        return data
+
+    def aa2joints(self, data, gender="male", betas=None):
+        ## data: axis angle
+        with torch.no_grad():
+            root_orient = torch.Tensor(data[:, 3:6]).to(
+                self.device
+            )  # controls the global root orientation
+            pose_body = torch.Tensor(data[:, 6:69]).to(self.device)  # controls the body
+            trans = torch.Tensor(data[:, :3]).to(self.device)
+            if gender == "male":
+                body = self.male_bm(
+                    pose_body=pose_body, betas=betas, root_orient=root_orient
+                )
+            else:
+                body = self.female_bm(
+                    pose_body=pose_body, betas=betas, root_orient=root_orient
+                )
+            pose_seq = body.Jtr + trans[:, None, :]
+
+        return pose_seq, body
+
+    def to_aist_axis_angle_from6d(self, smpl_motion: torch.Tensor) -> torch.Tensor:
+        trans = smpl_motion[:, :3]
+        rots = smpl_motion[:, 3:]
+
+        new_aa_rotations = geometry.matrix_to_axis_angle(
+            geometry.rotation_6d_to_matrix(rots.reshape(-1, 22, 6))
+        ).reshape(rots.shape[0], -1)
+        smpl_aa = torch.cat([trans, new_aa_rotations], 1)
+
+        return smpl_aa
+
+    def get_hml_rep(self, positions: torch.Tensor):
+        data, ground_positions, positions, l_velocity = process_file(
+            np.array(positions), 0.002
+        )
+        rec_ric_data = recover_from_ric(
+            torch.from_numpy(data).unsqueeze(0).float(), joints_num
+        )
+
+        return data, rec_ric_data.squeeze().numpy()
+
+    def smpl2hml(self, motion6d):
+        motion_aa = self.to_aist_axis_angle_from6d(motion6d)
+        pose_seq, body = self.aa2joints(motion_aa)
+        data, rec_ric_data = self.get_hml_rep(pose_seq.cpu().numpy())
+
+        return data

@@ -100,6 +100,11 @@ class VQMotionDataset(data.Dataset):
             self.motion_dir = os.path.join(self.data_root, "new_joint_vecs")
             self.music_dir = os.path.join(self.data_root, "music")
 
+        if dataset_name == "moyo":
+            self.data_root = os.path.join(data_root, "MOYO" + a)
+            self.motion_dir = os.path.join(self.data_root, "new_joint_vecs")
+            # self.music_dir = os.path.join(self.data_root, "music")
+
         joints_num = self.joints_num
 
         self.mean = np.load(os.path.join(data_root, "Mean.npy"))
@@ -127,7 +132,6 @@ class VQMotionDataset(data.Dataset):
         print("Total number of motions {}".format(len(self.data)))
 
     def inv_transform(self, data: torch.Tensor) -> torch.Tensor:
-        print(data.shape, self.std[: data.shape[-1]].shape)
         return data * (
             torch.Tensor(self.std[: data.shape[-1]]).to(data.device) - 1e-8
         ) + torch.Tensor(self.mean[: data.shape[-1]]).to(data.device)

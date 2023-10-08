@@ -7,17 +7,27 @@ DEFAULT_T5_NAME = "google/t5-v1_1-base"
 # "google/t5-v1_1-base"
 # "google/flan-t5-xl"
 
+from dataclasses import dataclass
+
+
+@dataclass
+class TextEncoderParams:
+    padding: str = "longest"
+    target: str = "google/t5-v1_1-base"
+    max_length: int = 128
+
 
 class T5:
     def __init__(
-        self, max_length, name=DEFAULT_T5_NAME, device=torch.device("cuda")
+        self, params: TextEncoderParams = TextEncoderParams, device=torch.device("cuda")
     ) -> None:
         self.device = device
-        self.max_length = max_length
-        self.config = T5Config.from_pretrained(name)
+        self.max_length = params.max_length
+        self.padding = params.padding
+        self.config = T5Config.from_pretrained(params.name)
         self.dim = self.config.d_model
-        self.tokenizer = T5Tokenizer.from_pretrained(name)
-        self.encoder = T5EncoderModel.from_pretrained(name).to(self.device)
+        self.tokenizer = T5Tokenizer.from_pretrained(params.name)
+        self.encoder = T5EncoderModel.from_pretrained(params.name).to(self.device)
 
     def load(self, path):
         pkg = torch.load(str(path), map_location="cuda")
@@ -27,7 +37,7 @@ class T5:
         encoded = self.tokenizer(
             texts,
             return_tensors="pt",
-            padding="longest",
+            padding=self.padding,
             max_length=self.max_length,
             truncation=True,
         )
@@ -37,7 +47,7 @@ class T5:
 
         return input_ids, attn_mask
 
-    def t5_encode_text(
+    def get_text_embedding(
         self,
         texts: Union[str, List[str]],
         mask_id: float = 0.0,
@@ -59,14 +69,18 @@ class T5:
 
 
 class Clip:
-    def __init__(self, device) -> None:
+    def __init__(
+        self, params: TextEncoderParams = None, device=torch.device("cuda")
+    ) -> None:
         self.device = device
-        self.clip_model, self.preprocess = clip.load("ViT-B/32", device).eval()
+        self.clip_model, self.preprocess = clip.load("ViT-B/32", device)
         clip.model.convert_weights(self.clip_model)
         for p in self.clip_model.parameters():
             p.requires_grad = False
 
-    def get_text_embedding(self, texts):
+        self.clip_model = self.clip_model.eval()
+
+    def get_text_embedding(self, texts, mask_id=None):
         if isinstance(texts, str):
             texts = [texts]
 

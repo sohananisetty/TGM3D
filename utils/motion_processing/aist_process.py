@@ -8,6 +8,8 @@ from scipy.spatial.transform import Rotation as R
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+from utils.motion_processing.hml_process import process_file
+
 
 # Lower legs
 l_idx1, l_idx2 = 5, 8
@@ -25,10 +27,11 @@ class AISTProcess:
     def __init__(self, device) -> None:
         self.device = device
         self.smpl_model = SMPL().eval().to(device)
+        self.joints_num = 22
 
     def aist_6d_to_smpl(self, aist_vec):
         aist_ex = torch.Tensor(aist_vec)
-        trans = aist_ex[:, :3]
+        trans = aist_ex[:, :3].to(self.device)
         if aist_vec.shape[-1] == 135:
             rots = torch.cat((aist_ex[:, 3:], aist_ex[:, -12:]), 1)
         else:
@@ -36,8 +39,8 @@ class AISTProcess:
         aist_ex_9d = geometry.rotation_6d_to_matrix(rots.reshape(-1, 6)).reshape(
             aist_vec.shape[0], 24, 3, 3
         )
-        global_orient = aist_ex_9d[:, 0:1]
-        rotations = aist_ex_9d[:, 1:]
+        global_orient = aist_ex_9d[:, 0:1].to(self.device)
+        rotations = aist_ex_9d[:, 1:].to(self.device)
         out_aist_og = self.smpl_model(
             body_pose=rotations, global_orient=global_orient, transl=trans
         )
@@ -69,6 +72,17 @@ class AISTProcess:
 
         return smpl_6d
 
+    def to_aist_axis_angle_from6d(self, smpl_motion: torch.Tensor) -> torch.Tensor:
+        trans = smpl_motion[:, :3]
+        rots = smpl_motion[:, 3:]
+
+        new_aa_rotations = geometry.matrix_to_axis_angle(
+            geometry.rotation_6d_to_matrix(rots.reshape(-1, 22, 6))
+        ).reshape(rots.shape[0], -1)
+        smpl_aa = torch.cat([trans, new_aa_rotations], 1)
+
+        return smpl_aa
+
     def process_and_center_aist(self, sml: torch.Tensor) -> torch.Tensor:
         ## up="y"
         seq_len = sml.shape[0]
@@ -90,21 +104,21 @@ class AISTProcess:
         positions_kyp = smpl_output["smpl"]
 
         """Put on Floor"""
-        floor_height = positions_kyp.min(axis=0).min(axis=0)[1]
+        floor_height = (positions_kyp.min(axis=0).values).min(axis=0).values[1]
 
         positions_ = sml[:, :3]
 
         positions_[:, 1] -= floor_height
         """XZ at origin"""
         root_pos_init = positions_[0]
-        root_pose_init_xy = root_pos_init * torch.Tensor([1, 0, 1])
+        root_pose_init_xy = root_pos_init * torch.Tensor([1, 0, 1]).to(self.device)
         positions_ = positions_ - root_pose_init_xy
 
         sml[:, :3] = positions_
 
         return sml
 
-    def resample(self, dat, in_fps=24, out_fps=20):
+    def resample(self, dat: torch.Tensor, in_fps=24, out_fps=20):
         df = pd.DataFrame(dat)
         df["timestamp"] = pd.date_range(
             start="2023-08-23 00:00:00",
@@ -115,7 +129,7 @@ class AISTProcess:
         resampled_df = df.resample(
             f"{round((1/out_fps)*1000 , 5)}ms"
         ).mean()  # Resample to 20 fps
-        resampled_motion = np.array(resampled_df)
+        resampled_motion = torch.Tensor(np.array(resampled_df))
         return resampled_motion
 
     def rotate_smpl_to(
@@ -156,9 +170,7 @@ class AISTProcess:
 
         def rotate_trans(translation):
             r = R.from_euler("XYZ", [0, 180, 0], degrees=True)
-            return (
-                translation[:, [2, 1, 0]][:, [1, 0, 2]] @ torch.round(r.as_matrix()).T
-            )
+            return translation[:, [2, 1, 0]][:, [1, 0, 2]] @ np.round(r.as_matrix()).T
 
         trans = rotate_trans(trans)
         final_rotated_smpl = torch.cat([trans, new_6d_rotations], 1)
@@ -183,14 +195,17 @@ class AISTProcess:
             geometry.quaternion_to_matrix(rotated_all_root_quat)
         )
 
-        input_smpl[:, :3] = trans @ r_matrix.T
+        input_smpl[:, :3] = trans @ (r_matrix.T.to(input_smpl_6d.device))
 
         return input_smpl
+
+    def clean_smpl(self, smpl: torch.Tensor):
+        pass
 
     def foot_detect(
         self, positions: torch.Tensor, thres: float
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        velfactor = torch.Tensor([thres, thres])
+        velfactor = torch.Tensor([thres, thres]).to(self.device)
 
         feet_l_x = (positions[1:, fid_l, 0] - positions[:-1, fid_l, 0]) ** 2
         feet_l_y = (positions[1:, fid_l, 1] - positions[:-1, fid_l, 1]) ** 2
@@ -260,3 +275,11 @@ class AISTProcess:
         )
 
         return processed_motion, fps
+
+    def aist6d_to_hml(self, motion6d):
+        smpl_keypoints = self.aist_6d_to_smpl(motion6d)["smpl"].cpu().numpy()
+        data, ground_positions, positions, l_velocity = process_file(
+            smpl_keypoints[:, : self.joints_num], 0.002
+        )
+
+        return data
